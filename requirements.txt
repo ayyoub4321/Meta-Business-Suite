@@ -1,0 +1,15 @@
+requests
+nltk
+matplotlib
+wordcloud
+Pillow
+cloudinary
+arabic-reshaper
+python-bidi
+torch
+diffusers
+transformers
+accelerate
+langchain_groq
+feedparser
+bs4
