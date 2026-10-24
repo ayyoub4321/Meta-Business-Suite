@@ -6,9 +6,7 @@ Pillow
 cloudinary
 arabic-reshaper
 python-bidi
-torch
-diffusers
-transformers
+
 accelerate
 langchain_groq
 feedparser
