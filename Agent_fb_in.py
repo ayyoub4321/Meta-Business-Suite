@@ -1,6 +1,7 @@
 import sys
 import faulthandler
-print("▶ Python démarré, chargement des modules…", flush=True)
+SCRIPT_VERSION = "2026-10-24-cloudflare-logo"
+print(f"▶ Python démarré (version {SCRIPT_VERSION}), chargement des modules…", flush=True)
 faulthandler.enable()
 # Si le script reste figé, affiche la pile d'appel toutes les 90 s (montre OÙ il bloque)
 faulthandler.dump_traceback_later(90, repeat=True, file=sys.stderr)
@@ -80,7 +81,18 @@ OUTPUT_DIR = BASE_DIR / "output"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # Logo de la page (PNG transparent conseillé), affiché en haut à gauche
-LOGO_PATH = Path(os.getenv("LOGO_PATH", str(BASE_DIR / "imgs" / "logo.png")))
+def _find_logo():
+    env = os.getenv("LOGO_PATH", "")
+    if env:
+        return Path(env)
+    for name in ("logo.png", "logo.jpg", "logo.jpeg"):
+        p = BASE_DIR / "imgs" / name
+        if p.is_file():
+            return p
+    return BASE_DIR / "imgs" / "logo.png"
+
+
+LOGO_PATH = _find_logo()
 # Mettre LOGO_BACKDROP=1 si ton logo est sombre (ajoute un fond foncé derrière)
 LOGO_BACKDROP = os.getenv("LOGO_BACKDROP", "0") == "1"
 
@@ -213,6 +225,8 @@ class TextPost:
             model_name=GROQ_MODEL,
             temperature=0.4,
             groq_api_key=os.getenv("TOKEN_AI_DESCRYB_IMG", ""),
+            timeout=60,
+            max_retries=1,
         )
 
     # ------------------------------------------------------------------
@@ -1149,31 +1163,42 @@ class Extract_post:
         """
         t = time.time()
         log(f"Traduction en arabe (Groq, modèle {self.model_groq_name})…")
-        try:
-            response = self.client.chat.completions.create(
-                model=self.model_groq_name,
-                messages=[
-                    {"role": "system", "content": prompt},
-                    {"role": "user", "content": f"SOURCE TEXT TO TRANSLATE:\n{text}"},
-                ],
-                temperature=0.0,
-                response_format={"type": "json_object"},
-            )
-            data = self._extract_json(response.choices[0].message.content)
-            log(f"Traduction reçue en {time.time() - t:.1f}s", level="OK")
-            return data
-        except Exception as e:
-            log(f"Traduction ÉCHOUÉE ({type(e).__name__}) : {str(e)[:400]}", level="ERROR")
-            if "model" in str(e).lower() and ("not" in str(e).lower() or "exist" in str(e).lower()):
-                log("   -> le modèle Groq n'existe pas / n'est plus disponible : "
-                    "change la variable GROQ_MODEL.", level="WARN")
-            return None
+        messages = [
+            {"role": "system", "content": prompt},
+            {"role": "user", "content": f"SOURCE TEXT TO TRANSLATE:\n{text}"},
+        ]
+        last_error = None
+        for mode_json in (True, False):   # 1) mode JSON strict, 2) texte libre puis extraction
+            try:
+                kwargs = {"response_format": {"type": "json_object"}} if mode_json else {}
+                response = self.client.chat.completions.create(
+                    model=self.model_groq_name,
+                    messages=messages,
+                    temperature=0.0,
+                    **kwargs,
+                )
+                data = self._extract_json(response.choices[0].message.content)
+                if isinstance(data, dict) and str(data.get("caption") or "").strip():
+                    log(f"Traduction reçue en {time.time() - t:.1f}s", level="OK")
+                    return data
+                last_error = f"réponse sans 'caption' : {str(data)[:150]}"
+                log(f"Traduction inexploitable ({last_error})", level="WARN")
+            except Exception as e:
+                last_error = f"{type(e).__name__} : {str(e)[:300]}"
+                log(f"Traduction essai {'JSON' if mode_json else 'texte'} échoué ({last_error})",
+                    level="WARN")
+        log(f"Traduction ÉCHOUÉE : {last_error}", level="ERROR")
+        if last_error and "model" in last_error.lower() and (
+                "not" in last_error.lower() or "exist" in last_error.lower()):
+            log("   -> le modèle Groq n'existe pas / n'est plus disponible : "
+                "change la variable GROQ_MODEL.", level="WARN")
+        return None
 
 
 # ======================================================================
 # MAIN
 # ======================================================================
-GROQ_FALLBACKS = ("qwen/qwen3-32b", "llama-3.3-70b-versatile", "openai/gpt-oss-120b",
+GROQ_FALLBACKS = ("llama-3.3-70b-versatile", "openai/gpt-oss-120b", "qwen/qwen3-32b",
                   "llama-3.1-8b-instant")
 TOTAL_STEPS = 6
 
@@ -1202,6 +1227,7 @@ def diagnostic_environnement():
     """Affiche la config + la présence des secrets (jamais leur valeur). Renvoie les manquants."""
     log(f"Python {sys.version.split()[0]} | Pillow {PIL.__version__} | "
         f"GitHub Actions : {'oui' if IS_GHA else 'non'}")
+    log(f"Script : {Path(__file__).name} | version {SCRIPT_VERSION}")
     log(f"Heure UTC : {datetime.now(timezone.utc):%Y-%m-%d %H:%M:%S}")
     log(f"Réglages : Groq={GROQ_MODEL} | image CF={CF_IMAGE_MODEL} | image HF={HF_IMAGE_MODEL} | "
         f"candidats={IMAGE_CANDIDATES} | max posts={MAX_POSTS_PER_RUN} | "
