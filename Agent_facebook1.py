@@ -1,3 +1,5 @@
+from diffusers import AutoPipelineForText2Image, AutoencoderKL, DPMSolverMultistepScheduler
+from transformers import CLIPModel, CLIPProcessor
 import os
 import json
 import re
@@ -20,7 +22,6 @@ from langchain_groq import ChatGroq
 from groq import Groq
 import feedparser
 import torch
-from diffusers import AutoPipelineForText2Image
 from datetime import datetime, timezone
 
 TRUSTED_WEB_SOURCES = {
@@ -62,17 +63,27 @@ class TextPost:
         model_id = "stabilityai/stable-diffusion-xl-base-1.0"
 
         if torch.cuda.is_available():
-            device, dtype, variant = "cuda", torch.float16, "fp16"
+            self.device, dtype, variant = "cuda", torch.float16, "fp16"
         elif torch.backends.mps.is_available():
-            device, dtype, variant = "mps", torch.float16, "fp16"
+            self.device, dtype, variant = "mps", torch.float16, "fp16"
         else:
-            device, dtype, variant = "cpu", torch.float32, None
+            self.device, dtype, variant = "cpu", torch.float32, None
 
+        # VAE corrigé : évite images noires/bruitées en fp16
+        vae = AutoencoderKL.from_pretrained(
+            "madebyollin/sdxl-vae-fp16-fix", torch_dtype=dtype
+        )
         self.pipeline = AutoPipelineForText2Image.from_pretrained(
-            model_id, 
-            torch_dtype=dtype, 
-            variant=variant
-        ).to(device)
+            model_id, vae=vae, torch_dtype=dtype,
+            variant=variant, use_safetensors=True
+        ).to(self.device)
+        self.pipeline.scheduler = DPMSolverMultistepScheduler.from_config(
+            self.pipeline.scheduler.config, use_karras_sigmas=True
+        )
+
+        # CLIP pour choisir l'image la plus fidèle à la news
+        self.clip = CLIPModel.from_pretrained("openai/clip-vit-large-patch14").to(self.device)
+        self.clip_proc = CLIPProcessor.from_pretrained("openai/clip-vit-large-patch14")
 
     def donne_moi_prompt_images(self, news):
         system_prompt = """
@@ -117,32 +128,61 @@ class TextPost:
         except Exception as e:
             print(f"Erreur LLM prompt generation: {e}")
             class Fallback:
-                content = "POSITIVE PROMPT:\nA realistic financial photo of high-resolution stock market charts on trading monitors, stacks of cash bills, cinematic lighting, editorial style\nNEGATIVE PROMPT:\nabstract, 3d render, neon, text, letters, human, face, watermark"
+                content = ("POSITIVE PROMPT:\nstock market trading floor screens with green and red "
+                           "candlestick charts, stacks of banknotes, editorial photo, 85mm, sharp focus\n"
+                           "NEGATIVE PROMPT:\nabstract, 3d render, neon, text, letters, human, face, watermark, blurry")
             return Fallback()
-    def generer_image(self, news_original=None):
-        print("Génération de l'image dynamique...")
-        obj_describe = self.donne_moi_prompt_images(news_original)
-        text_describe = obj_describe.content
-        
-        try:
-            positive_prompt = text_describe.split("NEGATIVE PROMPT:")[1].strip()
-            negative_prompt = text_describe.split("NEGATIVE PROMPT:")[0].split("POSITIVE PROMPT:")[1].strip()
-        except Exception:
-            positive_prompt = "Futuristic 3D abstract financial data architecture, glowing neon lights"
-            negative_prompt = "text, letters, words, numbers, watermark, signature, human, face, blurry"
+    @staticmethod
+    def _parse_prompts(text):
+        text = re.sub(r"<think>.*?</think>", "", text, flags=re.S | re.I)
+        pos = re.search(r"POSITIVE PROMPT:\s*(.*?)\s*NEGATIVE PROMPT:", text, re.S | re.I)
+        neg = re.search(r"NEGATIVE PROMPT:\s*(.*)", text, re.S | re.I)
+        if not pos or not neg:
+            return None, None
+        return pos.group(1).strip(), neg.group(1).strip()
 
-        image = self.pipeline(
-            prompt=positive_prompt,
-            negative_prompt=negative_prompt,
-            num_inference_steps=4,
-            guidance_scale=1.2
-        ).images[0]
+    def _clip_score(self, image, text):
+        inputs = self.clip_proc(text=[text], images=image, return_tensors="pt",
+                                padding=True, truncation=True, max_length=77).to(self.device)
+        with torch.no_grad():
+            out = self.clip(**inputs)
+        return out.logits_per_image.item()
+
+    def generer_image(self, news_original=None, n_candidates=3):
+        print("Génération de l'image dynamique...")
+        text_describe = self.donne_moi_prompt_images(news_original).content
+        positive_prompt, negative_prompt = self._parse_prompts(text_describe)
+
+        if not positive_prompt:
+            positive_prompt = ("stock market trading screens with candlestick charts, "
+                               "stacks of banknotes, editorial photo")
+            negative_prompt = "abstract, 3d render, neon, text, letters, human, face, watermark, blurry"
+
+        positive_prompt += ", professional editorial photography, photorealistic, sharp focus, high detail"
+        negative_prompt += ", lowres, deformed, noisy, grainy, oversaturated"
+
+        # Génère plusieurs candidats, garde le plus proche de la news
+        best_img, best_score = None, -1e9
+        titre = (news_original or "").split("\n")[0][:300]
+        for i in range(n_candidates):
+            gen = torch.Generator(device=self.device if self.device != "mps" else "cpu").manual_seed(int(time.time()) + i)
+            img = self.pipeline(
+                prompt=positive_prompt,
+                negative_prompt=negative_prompt,
+                num_inference_steps=30,
+                guidance_scale=6.5,
+                width=1024, height=1024,
+                generator=gen,
+            ).images[0]
+            score = self._clip_score(img, titre)
+            print(f"Candidat {i+1}: score CLIP = {score:.2f}")
+            if score > best_score:
+                best_img, best_score = img, score
 
         output = OUTPUT_DIR / "img.png"
-        image.save(output)
-        print(f"Terminé ! L'image dynamique est sauvegardée sous {output}")
+        best_img.save(output)
+        print(f"Image sauvegardée : {output}")
         return output
-
     def publier_texte_partout(self, news_original, news_translited):
         resultats = {
             "image": None,
