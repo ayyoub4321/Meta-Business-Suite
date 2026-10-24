@@ -11,4 +11,5 @@ accelerate
 langchain_groq
 feedparser
 bs4
-
+arabic-reshaper
+python-bidi
