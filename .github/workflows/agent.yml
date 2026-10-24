@@ -20,7 +20,7 @@ env:
 jobs:
   publier:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 60
 
     steps:
       - name: Checkout
@@ -54,7 +54,7 @@ jobs:
 
       - name: Lancer l'agent
         timeout-minutes: 10
-        run: python -u Agent_fb_in.py
+        run: python -u Agent_facebook1.py
         env:
           PAGE_ID: ${{ secrets.PAGE_ID }}
           PAGE_ACCESS_TOKEN: ${{ secrets.PAGE_ACCESS_TOKEN }}
