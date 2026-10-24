@@ -2,7 +2,7 @@ name: Agent Facebook Instagram
 
 on:
   schedule:
-    - cron: "0 * * * *"   # toutes les 3 heures (modifie selon ton besoin)
+    - cron: "*/20 * * * *"    # toutes les 3 heures (modifie selon ton besoin)
   workflow_dispatch:         # lancement manuel depuis l'onglet Actions
 
 permissions:
@@ -34,7 +34,7 @@ jobs:
                       groq langchain-groq huggingface_hub
 
       - name: Lancer l'agent
-        run: python -u Agent_facebook1.py
+        run: python -u Agent_fb_in.py
         env:
           PAGE_ID: ${{ secrets.PAGE_ID }}
           PAGE_ACCESS_TOKEN: ${{ secrets.PAGE_ACCESS_TOKEN }}
