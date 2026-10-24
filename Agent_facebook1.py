@@ -1,28 +1,21 @@
-from diffusers import AutoPipelineForText2Image, AutoencoderKL, DPMSolverMultistepScheduler
-from transformers import CLIPModel, CLIPProcessor
 import os
+import io
 import json
 import re
-import string
-import urllib.request
-from pathlib import Path
-
-import nltk
-import matplotlib
-matplotlib.use("Agg")
-
-import matplotlib.pyplot as plt
-from bs4 import BeautifulSoup
 import time
+import urllib.parse
+from pathlib import Path
+from datetime import datetime, timezone
+
 import requests
-from PIL import Image
+import feedparser
 import cloudinary
 import cloudinary.uploader
-from langchain_groq import ChatGroq
+from bs4 import BeautifulSoup
+from PIL import Image
 from groq import Groq
-import feedparser
-import torch
-from datetime import datetime, timezone
+from langchain_groq import ChatGroq
+from huggingface_hub import InferenceClient
 
 TRUSTED_WEB_SOURCES = {
     "FXStreet": "https://www.fxstreet.com/rss/news",
@@ -30,174 +23,150 @@ TRUSTED_WEB_SOURCES = {
     "ActionForex Fundamental": "https://www.actionforex.com/category/fundamental-analysis/feed/",
 }
 
-PAGE_ID = os.getenv("PAGE_ID", "")
-INSTAGRAM_BUSINESS_ID = os.getenv("INSTAGRAM_BUSINESS_ID", "")
-API_VERSION = "v21.0"
-
-FB_BASE_URL = f"https://graph.facebook.com/{API_VERSION}/{PAGE_ID}"
-IG_BASE_URL = f"https://graph.facebook.com/{API_VERSION}/{INSTAGRAM_BUSINESS_ID}"
-BASE_URL = FB_BASE_URL
+GROQ_MODEL = "qwen/qwen3.8-27b"
+HF_IMAGE_MODEL = "black-forest-labs/FLUX.1-schnell"
+GRAPH_URL = "https://graph.facebook.com/v26.0"
 
 BASE_DIR = Path(__file__).resolve().parent if "__file__" in globals() else Path.cwd()
-
-ASSETS_DIR = BASE_DIR / "assets"
-FONTS_DIR = ASSETS_DIR / "fonts"
 OUTPUT_DIR = BASE_DIR / "output"
-NLTK_DIR = BASE_DIR / ".data" / "nltk"
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-for dossier in (FONTS_DIR, OUTPUT_DIR, NLTK_DIR):
-    dossier.mkdir(parents=True, exist_ok=True)
-
-if str(NLTK_DIR) not in nltk.data.path:
-    nltk.data.path.insert(0, str(NLTK_DIR))
 
 class TextPost:
     def __init__(self):
-        model_groq_name = "qwen/qwen3.8-27b"
         self.llm = ChatGroq(
-            model_name=model_groq_name,
-            temperature=0.8,
-            groq_api_key=os.getenv("TOKEN_AI_DESCRYB_IMG", "")
-        )
-        
-        model_id = "stabilityai/stable-diffusion-xl-base-1.0"
-
-        if torch.cuda.is_available():
-            self.device, dtype, variant = "cuda", torch.float16, "fp16"
-        elif torch.backends.mps.is_available():
-            self.device, dtype, variant = "mps", torch.float16, "fp16"
-        else:
-            self.device, dtype, variant = "cpu", torch.float32, None
-
-        # VAE corrigé : évite images noires/bruitées en fp16
-        vae = AutoencoderKL.from_pretrained(
-            "madebyollin/sdxl-vae-fp16-fix", torch_dtype=dtype
-        )
-        self.pipeline = AutoPipelineForText2Image.from_pretrained(
-            model_id, vae=vae, torch_dtype=dtype,
-            variant=variant, use_safetensors=True
-        ).to(self.device)
-        self.pipeline.scheduler = DPMSolverMultistepScheduler.from_config(
-            self.pipeline.scheduler.config, use_karras_sigmas=True
+            model_name=GROQ_MODEL,
+            temperature=0.4,
+            groq_api_key=os.getenv("TOKEN_AI_DESCRYB_IMG", ""),
         )
 
-        # CLIP pour choisir l'image la plus fidèle à la news
-        self.clip = CLIPModel.from_pretrained("openai/clip-vit-large-patch14").to(self.device)
-        self.clip_proc = CLIPProcessor.from_pretrained("openai/clip-vit-large-patch14")
-
+    # ------------------------------------------------------------------
+    # 1) Prompt d'image à partir de la news
+    # ------------------------------------------------------------------
     def donne_moi_prompt_images(self, news):
-        system_prompt = """
-        You are an uncompromising, world-class Financial Photojournalist and Editorial Art Director.
-        Your sole task is to generate realistic, accurate visual prompts for real-world financial news photos.
-        You strictly forbid abstract designs, 3D wireframes, glowing neon elements, and generic futuristic shapes.
-        """
-        
+        system_prompt = (
+            "You are an uncompromising, world-class Financial Photojournalist and "
+            "Editorial Art Director. Your sole task is to write realistic visual "
+            "prompts for real-world financial news photos. You strictly forbid "
+            "abstract designs, 3D wireframes, glowing neon elements and generic "
+            "futuristic shapes."
+        )
+
         user_prompt = f"""
-        ANALYZE THIS FINANCIAL NEWS CAREFULLY:
-        "{news}"
+        FINANCIAL NEWS:
+        "{(news or '')[:600]}"
 
-        STEP 1: IDENTIFY THE REAL-WORLD ASSETS & SUBJECTS
-        Identify the concrete entities mentioned in the news:
-        - Currencies (e.g., stacks of US Dollar bills, Euro banknotes, Gold bullion bars)
-        - Commodities (e.g., crude oil barrels, energy grids, agricultural goods)
-        - Institutions & Buildings (e.g., Federal Reserve headquarters, Wall Street stock exchange floor, Central Bank vaults)
-        - Market Trends (e.g., stock market trading screens showing green or red chart candles)
+        Write ONE photorealistic editorial photo description that visually represents
+        the MAIN SUBJECT of this news (e.g. bond yields falling -> Treasury bonds and a
+        bond trading desk; tech selloff -> trading screens with red candles and a
+        stock exchange floor; gold -> gold bars; oil -> refinery or oil barrels;
+        central bank -> central bank building; US dollar -> dollar banknotes).
+        The first words must name that main subject. Max 50 words.
+        No text, no letters, no logos, no people, no faces, no abstract shapes,
+        no leather, no wood, no generic office props.
+        End with: photorealistic, 85mm lens, natural cinematic lighting, sharp focus.
 
-        STEP 2: CREATE A PHOTOREALISTIC SCENE
-        Describe a real-world, high-end editorial photo suitable for Bloomberg or Reuters news headers.
-
-        STRICT RULES & CONSTRAINTS:
-        1. REALISM ONLY: Must look like a real photo shot with a 85mm lens, f/1.8 aperture, natural cinematic lighting.
-        2. NO ABSTRACT ELEMENTS: Zero 3D floating shapes, zero wireframes, zero glowing neon lines, zero abstract energy pendulums.
-        3. NO TEXT/FACES: NO text, words, numbers, letters, logos, watermarks, human faces, or human figures.
-
-        STRICT OUTPUT FORMAT (Output ONLY these two lines):
+        OUTPUT ONLY this format:
         POSITIVE PROMPT:
-        [Photorealistic description of concrete financial items matching the news context, captured with professional editorial photography, sharp focus, dramatic studio lighting]
+        [description]
 
         NEGATIVE PROMPT:
-        abstract, 3d render, floating shapes, wireframe, neon lights, generic geometric shapes, text, letters, words, numbers, watermark, signature, human, face, blurry, cartoon, illustration
+        abstract, 3d render, neon, text, letters, numbers, watermark, human, face, blurry, cartoon
         """
 
         try:
-            response = self.llm.invoke([
+            return self.llm.invoke([
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt}
+                {"role": "user", "content": user_prompt},
             ])
-            return response
         except Exception as e:
             print(f"Erreur LLM prompt generation: {e}")
+
             class Fallback:
-                content = ("POSITIVE PROMPT:\nstock market trading floor screens with green and red "
-                           "candlestick charts, stacks of banknotes, editorial photo, 85mm, sharp focus\n"
-                           "NEGATIVE PROMPT:\nabstract, 3d render, neon, text, letters, human, face, watermark, blurry")
+                content = (
+                    "POSITIVE PROMPT:\nstock market trading floor screens with green and red "
+                    "candlestick charts, stacks of banknotes, editorial photo, 85mm, sharp focus\n"
+                    "NEGATIVE PROMPT:\nabstract, 3d render, neon, text, letters, human, face, "
+                    "watermark, blurry"
+                )
+
             return Fallback()
+
     @staticmethod
     def _parse_prompts(text):
-        text = re.sub(r"<think>.*?</think>", "", text, flags=re.S | re.I)
+        text = re.sub(r"<think>.*?</think>", "", text or "", flags=re.S | re.I)
         pos = re.search(r"POSITIVE PROMPT:\s*(.*?)\s*NEGATIVE PROMPT:", text, re.S | re.I)
         neg = re.search(r"NEGATIVE PROMPT:\s*(.*)", text, re.S | re.I)
         if not pos or not neg:
             return None, None
         return pos.group(1).strip(), neg.group(1).strip()
 
-    def _clip_score(self, image, text):
-        inputs = self.clip_proc(text=[text], images=image, return_tensors="pt",
-                                padding=True, truncation=True, max_length=77).to(self.device)
-        with torch.no_grad():
-            out = self.clip(**inputs)
-        return out.logits_per_image.item()
+    # ------------------------------------------------------------------
+    # 2) Génération de l'image via API (rapide, pas de GPU nécessaire)
+    # ------------------------------------------------------------------
+    def _image_hf(self, prompt):
+        token = os.getenv("HF_TOKEN", "")
+        if not token:
+            print("HF_TOKEN absent : passage au fallback Pollinations.")
+            return None
+        try:
+            client = InferenceClient(api_key=token)
+            image = client.text_to_image(prompt, model=HF_IMAGE_MODEL)
+            return image.convert("RGB")
+        except Exception as e:
+            print(f"HF inference indisponible : {e}")
+            return None
 
-    def generer_image(self, news_original=None, n_candidates=3):
-        print("Génération de l'image dynamique...")
+    def _image_pollinations(self, prompt):
+        url = (
+            "https://image.pollinations.ai/prompt/"
+            + urllib.parse.quote(prompt)
+            + f"?model=flux&width=1024&height=1024&nologo=true&seed={int(time.time())}"
+        )
+        try:
+            r = requests.get(url, timeout=120)
+            r.raise_for_status()
+            return Image.open(io.BytesIO(r.content)).convert("RGB")
+        except Exception as e:
+            print(f"Pollinations indisponible : {e}")
+            return None
+
+    def generer_image(self, news_original=None):
+        print("Génération de l'image...")
         text_describe = self.donne_moi_prompt_images(news_original).content
-        positive_prompt, negative_prompt = self._parse_prompts(text_describe)
+        positive_prompt, _ = self._parse_prompts(text_describe)
 
         if not positive_prompt:
-            positive_prompt = ("stock market trading screens with candlestick charts, "
-                               "stacks of banknotes, editorial photo")
-            negative_prompt = "abstract, 3d render, neon, text, letters, human, face, watermark, blurry"
+            titre = (news_original or "").split("\n")[0][:150]
+            positive_prompt = (
+                f"editorial news photo illustrating: {titre}, "
+                "photorealistic, 85mm lens, sharp focus"
+            )
 
-        positive_prompt += ", professional editorial photography, photorealistic, sharp focus, high detail"
-        negative_prompt += ", lowres, deformed, noisy, grainy, oversaturated"
+        # FLUX ignore le negative prompt : les interdits sont mis dans le positif
+        positive_prompt = " ".join(positive_prompt.split()[:60])
+        positive_prompt += ", no text, no letters, no people, photorealistic"
+        print("Prompt image :", positive_prompt)
 
-        # Génère plusieurs candidats, garde le plus proche de la news
-        best_img, best_score = None, -1e9
-        titre = (news_original or "").split("\n")[0][:300]
-        for i in range(n_candidates):
-            gen = torch.Generator(device=self.device if self.device != "mps" else "cpu").manual_seed(int(time.time()) + i)
-            img = self.pipeline(
-                prompt=positive_prompt,
-                negative_prompt=negative_prompt,
-                num_inference_steps=30,
-                guidance_scale=6.5,
-                width=1024, height=1024,
-                generator=gen,
-            ).images[0]
-            score = self._clip_score(img, titre)
-            print(f"Candidat {i+1}: score CLIP = {score:.2f}")
-            if score > best_score:
-                best_img, best_score = img, score
+        img = self._image_hf(positive_prompt) or self._image_pollinations(positive_prompt)
+        if img is None:
+            raise RuntimeError("Aucune image générée : publication annulée.")
 
         output = OUTPUT_DIR / "img.png"
-        best_img.save(output)
+        img.save(output)
         print(f"Image sauvegardée : {output}")
         return output
+
+    # ------------------------------------------------------------------
+    # 3) Publication Facebook + Instagram
+    # ------------------------------------------------------------------
     def publier_texte_partout(self, news_original, news_translited):
-        resultats = {
-            "image": None,
-            "facebook": False,
-            "instagram": False
-        }
+        resultats = {"image": None, "facebook": False, "instagram": False}
 
         try:
-            print("Génération de l'image...")
-            imgs_path = self.generer_image(news_original=news_original)
-            chemin = Path(imgs_path)
-
+            chemin = Path(self.generer_image(news_original=news_original))
             if not chemin.is_file():
                 raise FileNotFoundError(f"Image générée introuvable : {chemin.resolve()}")
-
             resultats["image"] = str(chemin.resolve())
 
             page_id = os.getenv("PAGE_ID", "")
@@ -211,75 +180,86 @@ class TextPost:
             if not token:
                 raise ValueError("PAGE_ACCESS_TOKEN est absent.")
 
-            graph_url = "https://graph.facebook.com/v26.0"
-
-            # Facebook
+            # ---------------- Facebook ----------------
             if page_id:
-                endpoint_fb = f"{graph_url}/{page_id}/photos"
                 mime = "image/jpeg" if chemin.suffix.lower() in (".jpg", ".jpeg") else "image/png"
                 try:
                     with chemin.open("rb") as fichier:
                         response = requests.post(
-                            endpoint_fb,
+                            f"{GRAPH_URL}/{page_id}/photos",
                             data={"message": news_translited, "access_token": token},
                             files={"source": (chemin.name, fichier, mime)},
-                            timeout=120
+                            timeout=120,
                         )
-                    data_fb = response.json() if response.headers.get('content-type', '').startswith('application/json') else {"message": response.text[:1000]}
+                    if response.headers.get("content-type", "").startswith("application/json"):
+                        data_fb = response.json()
+                    else:
+                        data_fb = {"message": response.text[:1000]}
+
                     if response.ok and "error" not in data_fb:
                         resultats["facebook"] = True
                         print("Facebook : publication réussie.")
+                    else:
+                        print("Facebook : échec :", data_fb)
                 except Exception as erreur:
                     print("Erreur Facebook :", erreur)
 
-            # Instagram
+            # ---------------- Instagram ----------------
             if all([cloud_name, cloud_key, cloud_secret]) and ig_id:
                 try:
                     cloudinary.config(
                         cloud_name=cloud_name,
                         api_key=cloud_key,
                         api_secret=cloud_secret,
-                        secure=True
+                        secure=True,
                     )
                     jpeg_path = chemin.with_name(f"{chemin.stem}_instagram.jpg")
                     with Image.open(chemin) as image:
                         image.convert("RGB").save(jpeg_path, format="JPEG", quality=92, optimize=True)
 
-                    upload = cloudinary.uploader.upload(str(jpeg_path), resource_type="image", folder="actualites_financieres")
+                    upload = cloudinary.uploader.upload(
+                        str(jpeg_path), resource_type="image", folder="actualites_financieres"
+                    )
                     image_url = upload.get("secure_url")
 
                     if image_url and image_url.startswith("https://"):
                         creation_response = requests.post(
-                            f"{graph_url}/{ig_id}/media",
+                            f"{GRAPH_URL}/{ig_id}/media",
                             data={"image_url": image_url, "caption": news_translited, "access_token": token},
-                            timeout=90
+                            timeout=90,
                         )
                         creation_data = creation_response.json()
+
                         if creation_response.ok and "error" not in creation_data and creation_data.get("id"):
                             creation_id = creation_data["id"]
                             statut = None
                             for _ in range(12):
                                 statut_response = requests.get(
-                                    f"{graph_url}/{creation_id}",
+                                    f"{GRAPH_URL}/{creation_id}",
                                     params={"fields": "status_code", "access_token": token},
-                                    timeout=30
+                                    timeout=30,
                                 )
-                                statut_data = statut_response.json()
-                                statut = statut_data.get("status_code")
-                                if statut == "FINISHED" or statut == "ERROR":
+                                statut = statut_response.json().get("status_code")
+                                if statut in ("FINISHED", "ERROR"):
                                     break
                                 time.sleep(5)
 
                             if statut == "FINISHED":
                                 pub_response = requests.post(
-                                    f"{graph_url}/{ig_id}/media_publish",
+                                    f"{GRAPH_URL}/{ig_id}/media_publish",
                                     data={"creation_id": creation_id, "access_token": token},
-                                    timeout=90
+                                    timeout=90,
                                 )
                                 pub_data = pub_response.json()
                                 if pub_response.ok and "error" not in pub_data:
                                     resultats["instagram"] = True
                                     print("Instagram : publication réussie.")
+                                else:
+                                    print("Instagram : échec publication :", pub_data)
+                            else:
+                                print("Instagram : statut du média :", statut)
+                        else:
+                            print("Instagram : échec création média :", creation_data)
                 except Exception as erreur:
                     print("Erreur Instagram :", erreur)
 
@@ -291,9 +271,8 @@ class TextPost:
 
 class Extract_post:
     def __init__(self):
-        GROQ_API_KEY = os.getenv("TOKEN_AI_DESCRYB_IMG", "")
-        self.model_groq_name = "qwen/qwen3.8-27b"
-        self.client = Groq(api_key=GROQ_API_KEY)
+        self.model_groq_name = GROQ_MODEL
+        self.client = Groq(api_key=os.getenv("TOKEN_AI_DESCRYB_IMG", ""))
         self.TRUSTED_WEB_SOURCES = TRUSTED_WEB_SOURCES
 
     def clean_html(self, text):
@@ -305,9 +284,7 @@ class Extract_post:
         return soup.get_text(separator=" ", strip=True)
 
     def get_publication_date(self, entry):
-        published = entry.get("published_parsed")
-        updated = entry.get("updated_parsed")
-        date_struct = published or updated
+        date_struct = entry.get("published_parsed") or entry.get("updated_parsed")
         if not date_struct:
             return None, None
         date_utc = datetime(*date_struct[:6], tzinfo=timezone.utc)
@@ -354,7 +331,7 @@ class Extract_post:
                 print(f"Erreur pour {source_name}: {error}")
 
         articles.sort(key=lambda item: item["_datetime"], reverse=True)
-        
+
         result = {}
         for article in articles:
             src = article.pop("source_name")
@@ -374,13 +351,12 @@ class Extract_post:
                 model=self.model_groq_name,
                 messages=[
                     {"role": "system", "content": prompt},
-                    {"role": "user", "content": f"SOURCE TEXT TO TRANSLATE:\n{text}"}
+                    {"role": "user", "content": f"SOURCE TEXT TO TRANSLATE:\n{text}"},
                 ],
                 temperature=0.0,
-                response_format={"type": "json_object"}
+                response_format={"type": "json_object"},
             )
-            raw_output = response.choices[0].message.content
-            return json.loads(raw_output)
+            return json.loads(response.choices[0].message.content)
         except Exception as e:
             print(f"Erreur lors de l'appel Groq : {e}")
             return None
@@ -407,9 +383,9 @@ def main():
         with open(fichier_json, "w", encoding="utf-8") as f:
             json.dump({}, f, ensure_ascii=False, indent=4)
 
-    fetch_all_news = extract_post.fetch_all_news()
+    all_news = extract_post.fetch_all_news()
 
-    for source, news in fetch_all_news.items():
+    for source, news in all_news.items():
         vrai_source = source.split("_")[0]
         title = news["title"]
         content = news["continue"]
