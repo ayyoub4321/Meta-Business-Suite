@@ -493,7 +493,8 @@ def main():
             text_translated_net = " ".join(str(value) for value in text_translated.values())
         else:
             text_translated_net = str(text_translated)
-
+        if text_translated_net is None or text_translated_net=="":
+            break
         try:
             resultat = text_post.publier_texte_partout(text_original, text_translated_net)
 
