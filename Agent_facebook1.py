@@ -507,7 +507,7 @@ def main():
         except Exception as e:
             print(f"Erreur publication de '{title}' : {e}")
             continue
-        break
+    
 
     print("Fin de cette exécution.")
 
