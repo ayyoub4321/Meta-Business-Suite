@@ -183,7 +183,7 @@ class TextPost:
             # ==========================================
             # 2. VÉRIFIER LA CONFIGURATION
             # ==========================================
-            page_id = os.getenv("FACEBOOK_PAGE_ID", globals().get("PAGE_ID", ""))
+            page_id = os.getenv("PAGE_ID", globals().get("PAGE_ID", ""))
             token = os.getenv("PAGE_ACCESS_TOKEN", globals().get("PAGE_ACCESS_TOKEN", ""))
             ig_id = os.getenv(
                 "INSTAGRAM_BUSINESS_ID",
@@ -640,16 +640,14 @@ def main():
             try:
                 text_transleted_net=""
                 for key,value in text_transleted.items():
+from pathlib import Path
                     text_transleted_net+=f" {value}"
             except:
                 text_transleted_net=text_transleted
-
             # print("text original \n ",text_original)
             # print("text transleted \n ",text_transleted)
             # print("text transleted clean \n ",text_transleted_net)
-
             text_post.publier_texte_partout(text_original, text_transleted_net)
-
             # 5. Enregistrement en mémoire
             historique[post_id] = {
                 "source": vrai_source,
@@ -665,7 +663,5 @@ def main():
                 json.dump(historique, f, ensure_ascii=False, indent=4)
                 
         time.sleep(600)
-
 if __name__ == "__main__":
     main()
-
