@@ -76,32 +76,36 @@ class TextPost:
 
     def donne_moi_prompt_images(self, news):
         system_prompt = """
-        You are an elite, world-class Hollywood 3D Art Director and Master Visual Prompt Engineer for premium financial journalism. 
-        Your absolute superpower is transforming dry financial news articles into hyper-realistic, striking, dynamic 3D visual metaphors that tell a compelling story at a glance.
+        You are an uncompromising, world-class Financial Photojournalist and Editorial Art Director.
+        Your sole task is to generate realistic, accurate visual prompts for real-world financial news photos.
+        You strictly forbid abstract designs, 3D wireframes, glowing neon elements, and generic futuristic shapes.
         """
         
         user_prompt = f"""
-        Analyze the following financial news article with extreme care. Extract the unique economic event, trend, or decision. 
-        Then, create a completely unique, highly relevant, and breathtaking 3D visual scene that represents THIS specific news and nothing else.
+        ANALYZE THIS FINANCIAL NEWS CAREFULLY:
+        "{news}"
 
-        NEWS ARTICLE:
-        {news}
+        STEP 1: IDENTIFY THE REAL-WORLD ASSETS & SUBJECTS
+        Identify the concrete entities mentioned in the news:
+        - Currencies (e.g., stacks of US Dollar bills, Euro banknotes, Gold bullion bars)
+        - Commodities (e.g., crude oil barrels, energy grids, agricultural goods)
+        - Institutions & Buildings (e.g., Federal Reserve headquarters, Wall Street stock exchange floor, Central Bank vaults)
+        - Market Trends (e.g., stock market trading screens showing green or red chart candles)
 
-        STRICT GENERATION RULES:
-        1. UNIQUE VISUAL METAPHOR: Custom 3D elements matching the exact sentiment of the news.
-        2. CINEMATIC AESTHETIC & QUALITY:
-        - Style: Unreal Engine 5 hyper-realistic 3D render, Octane render.
-        - Background: Deep moody cinematic background (dark navy, obsidian slate #05070B).
-        - Lighting: Dramatic volumetric neon rim lighting.
-        3. ABSOLUTE CONSTRAINTS:
-        - NO text, letters, numbers, symbols, words, watermarks, signatures, human faces, or anatomy anywhere.
+        STEP 2: CREATE A PHOTOREALISTIC SCENE
+        Describe a real-world, high-end editorial photo suitable for Bloomberg or Reuters news headers.
 
-        OUTPUT FORMAT (STRICT):
+        STRICT RULES & CONSTRAINTS:
+        1. REALISM ONLY: Must look like a real photo shot with a 85mm lens, f/1.8 aperture, natural cinematic lighting.
+        2. NO ABSTRACT ELEMENTS: Zero 3D floating shapes, zero wireframes, zero glowing neon lines, zero abstract energy pendulums.
+        3. NO TEXT/FACES: NO text, words, numbers, letters, logos, watermarks, human faces, or human figures.
+
+        STRICT OUTPUT FORMAT (Output ONLY these two lines):
         POSITIVE PROMPT:
-        [Description]
+        [Photorealistic description of concrete financial items matching the news context, captured with professional editorial photography, sharp focus, dramatic studio lighting]
 
         NEGATIVE PROMPT:
-        text, letters, words, numbers, watermark, signature, human, face, blurry, low resolution
+        abstract, 3d render, floating shapes, wireframe, neon lights, generic geometric shapes, text, letters, words, numbers, watermark, signature, human, face, blurry, cartoon, illustration
         """
 
         try:
@@ -113,9 +117,8 @@ class TextPost:
         except Exception as e:
             print(f"Erreur LLM prompt generation: {e}")
             class Fallback:
-                content = "POSITIVE PROMPT:\nFuturistic 3D abstract financial data architecture\nNEGATIVE PROMPT:\ntext, letters, words, numbers, watermark"
+                content = "POSITIVE PROMPT:\nA realistic financial photo of high-resolution stock market charts on trading monitors, stacks of cash bills, cinematic lighting, editorial style\nNEGATIVE PROMPT:\nabstract, 3d render, neon, text, letters, human, face, watermark"
             return Fallback()
-
     def generer_image(self, news_original=None):
         print("Génération de l'image dynamique...")
         obj_describe = self.donne_moi_prompt_images(news_original)
