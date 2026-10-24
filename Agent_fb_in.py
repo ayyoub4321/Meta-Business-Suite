@@ -1,10 +1,14 @@
-import sys, faulthandler
+import sys
+import faulthandler
 print("▶ Python démarré, chargement des modules…", flush=True)
 faulthandler.enable()
 # Si le script reste figé, affiche la pile d'appel toutes les 90 s (montre OÙ il bloque)
 faulthandler.dump_traceback_later(90, repeat=True, file=sys.stderr)
+
 import os
 import io
+import base64
+import traceback
 import json
 import re
 import time
@@ -17,6 +21,7 @@ import feedparser
 import cloudinary
 import cloudinary.uploader
 from bs4 import BeautifulSoup
+import PIL
 from PIL import (
     Image, ImageDraw, ImageFont, ImageOps, ImageEnhance,
     ImageFilter, ImageChops, ImageStat, features,
@@ -24,7 +29,7 @@ from PIL import (
 from groq import Groq
 from langchain_groq import ChatGroq
 from huggingface_hub import InferenceClient
-print("▶ Modules chargés.", flush=True)
+
 try:
     import arabic_reshaper
     from bidi.algorithm import get_display
@@ -32,7 +37,8 @@ try:
 except ImportError:
     ARABIC_OK = False
     print("ATTENTION : pip install arabic-reshaper python-bidi (sinon l'arabe sera mal affiché)")
-print("▶ Modules arabic_reshaper  chargés.", flush=True)
+print("▶ Modules chargés.", flush=True)
+
 # ======================================================================
 # CONFIGURATION
 # ======================================================================
@@ -44,10 +50,10 @@ TRUSTED_WEB_SOURCES = {
 
 # Modifiables par variables d'environnement (sans toucher au code)
 GROQ_MODEL = os.getenv("GROQ_MODEL", "qwen/qwen3.8-27b")
-# Pour une qualité maximale (plus lent, crédits HF plus consommés) :
-#   HF_IMAGE_MODEL=black-forest-labs/FLUX.1-dev
+# Générateurs d'image, essayés dans cet ordre : Cloudflare -> Hugging Face -> Pollinations
+CF_IMAGE_MODEL = os.getenv("CF_IMAGE_MODEL", "@cf/black-forest-labs/flux-1-schnell")
 HF_IMAGE_MODEL = os.getenv("HF_IMAGE_MODEL", "black-forest-labs/FLUX.1-schnell")
-GRAPH_URL = "https://graph.facebook.com/v26.0"
+GRAPH_URL = "https://graph.facebook.com/" + os.getenv("GRAPH_VERSION", "v26.0")
 
 # Génération directement en portrait -> aucun recadrage destructif
 IMG_W, IMG_H = 1024, 1280      # multiples de 16 (requis par FLUX)
@@ -111,9 +117,97 @@ STYLE_SUFFIX = (
 
 
 # ======================================================================
+# LOGS : affichage en temps réel, étape par étape (visible dans GitHub Actions)
+# ======================================================================
+try:
+    sys.stdout.reconfigure(line_buffering=True, encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(line_buffering=True, encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
+IS_GHA = os.getenv("GITHUB_ACTIONS", "").lower() == "true"
+T0 = time.time()
+SECRET_ENV_NAMES = ("TOKEN_AI_DESCRYB_IMG", "HF_TOKEN", "PAGE_ACCESS_TOKEN",
+                    "CLOUDINARY_API_KEY", "CLOUDINARY_API_SECRET",
+                    "CF_API_TOKEN", "CF_ACCOUNT_ID")
+_ICONS = {"INFO": "  ", "STEP": "➡️ ", "OK": "✅", "WARN": "⚠️ ", "ERROR": "❌"}
+
+# Compteurs pour le résumé final
+STATS = {
+    "flux_ok": 0, "flux_ko": 0, "news_total": 0, "deja": 0, "anciennes": 0,
+    "candidates": 0, "tentatives": 0, "publies": 0, "echecs": [],
+}
+
+
+def _redact(text):
+    """Masque les secrets : un token ne doit JAMAIS apparaître dans les logs."""
+    s = str(text)
+    for name in SECRET_ENV_NAMES:
+        v = os.getenv(name, "")
+        if v and len(v) >= 6:
+            s = s.replace(v, "***")
+    return re.sub(r"(access_token=)[^&\s\"']+", r"\1***", s)
+
+
+def log(*args, level="INFO"):
+    """Une ligne de log horodatée, affichée immédiatement (flush)."""
+    msg = _redact(" ".join(str(a) for a in args))
+    print(f"[{time.time() - T0:6.1f}s] {_ICONS.get(level, '  ')} {msg}", flush=True)
+    if IS_GHA and level == "ERROR":  # apparaît aussi dans les annotations du run
+        print("::error::" + msg.replace("\r", " ").replace("\n", " ")[:300], flush=True)
+
+
+def banner(num, total, title):
+    print("", flush=True)
+    print("═" * 68, flush=True)
+    print(f" ÉTAPE {num}/{total} — {title}", flush=True)
+    print("═" * 68, flush=True)
+
+
+def step_summary(markdown):
+    """Ajoute du texte à la page 'Summary' du run GitHub Actions."""
+    path = os.getenv("GITHUB_STEP_SUMMARY")
+    if not path:
+        return
+    try:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(markdown + "\n")
+    except Exception:
+        pass
+
+
+def explain_graph_error(data):
+    """Transforme une erreur de l'API Meta en message clair + piste de solution."""
+    err = data.get("error", data) if isinstance(data, dict) else {}
+    if not isinstance(err, dict):
+        err = {}
+    msg = err.get("message") or str(data)[:300]
+    code, sub = err.get("code"), err.get("error_subcode")
+    hints = {
+        190: "Token invalide ou expiré : régénère un token longue durée de la Page.",
+        200: "Permission manquante (pages_manage_posts, pages_read_engagement, "
+             "instagram_content_publish...).",
+        10: "Permission refusée pour cette action.",
+        100: "Paramètre invalide : vérifie PAGE_ID / INSTAGRAM_BUSINESS_ID / URL image "
+             "(ou la version GRAPH_VERSION).",
+        368: "Blocage temporaire anti-spam de Meta : réduis la fréquence.",
+        4: "Limite d'appels API atteinte.", 17: "Limite d'appels API atteinte.",
+        32: "Limite d'appels API atteinte.", 613: "Limite d'appels API atteinte.",
+        9004: "Instagram n'arrive pas à télécharger l'image (URL).",
+        36000: "Image refusée (taille ou ratio non supporté).",
+    }
+    hint = hints.get(code)
+    return f"{msg} (code={code}, subcode={sub})" + (f"  →  {hint}" if hint else "")
+
+
+# ======================================================================
 # GÉNÉRATION DE POST (image + publication)
 # ======================================================================
 class TextPost:
+    # Services d'image désactivés pour le reste de l'exécution
+    # (crédits épuisés, token refusé...) : évite de perdre du temps à chaque image.
+    _dead = set()
+
     def __init__(self):
         self.llm = ChatGroq(
             model_name=GROQ_MODEL,
@@ -176,7 +270,7 @@ class TextPost:
                 {"role": "user", "content": user_prompt},
             ])
         except Exception as e:
-            print(f"Erreur LLM prompt generation: {e}")
+            log(f"LLM prompt image : erreur {type(e).__name__} : {str(e)[:300]}", level="ERROR")
 
             class Fallback:
                 content = ""
@@ -202,21 +296,78 @@ class TextPost:
         return DEFAULT_SCENE
 
     def _build_prompt(self, news):
+        t = time.time()
         text = self.donne_moi_prompt_images(news).content
+        log(f"LLM : réponse en {time.time() - t:.1f}s ({len(text or '')} caractères)")
         positive, _ = self._parse_prompts(text)
         if not positive or len(positive.split()) < 6:
             positive = self._fallback_scene(news)
+            log("LLM : prompt inexploitable -> scène de secours (mots-clés) utilisée.", level="WARN")
+        else:
+            log("LLM : prompt photo reçu.", level="OK")
         # FLUX ignore le negative prompt : les interdits sont dans le positif
         positive = " ".join(positive.split()[:70])
         return f"{positive}, {STYLE_SUFFIX}"
 
     # ------------------------------------------------------------------
-    # 2) Génération d'image (HF FLUX -> fallback Pollinations)
+    # 2) Génération d'image : Cloudflare -> Hugging Face -> Pollinations
     # ------------------------------------------------------------------
+    def _image_cloudflare(self, prompt, seed=None):
+        """Cloudflare Workers AI (FLUX.1 schnell) : 10 000 neurons gratuits par jour."""
+        account = os.getenv("CF_ACCOUNT_ID", "")
+        token = os.getenv("CF_API_TOKEN", "")
+        if not (account and token):
+            if "cloudflare_absent" not in self._dead:
+                log("CF_ACCOUNT_ID / CF_API_TOKEN absents -> Cloudflare ignoré.", level="WARN")
+                self._dead.add("cloudflare_absent")
+            return None
+        if "cloudflare" in self._dead:
+            return None
+
+        url = (f"https://api.cloudflare.com/client/v4/accounts/{account}"
+               f"/ai/run/{CF_IMAGE_MODEL}")
+        headers = {"Authorization": f"Bearer {token}"}
+        body = {"prompt": prompt[:2000], "steps": 6}   # schnell : 8 steps maximum
+        if seed is not None:
+            body["seed"] = int(seed) % 2_000_000_000
+
+        t = time.time()
+        try:
+            log(f"Cloudflare : {CF_IMAGE_MODEL} (steps={body['steps']})…")
+            r = requests.post(url, headers=headers, json=body, timeout=120)
+            if r.status_code == 400 and "seed" in body:   # seed refusé : on réessaie sans
+                body.pop("seed")
+                r = requests.post(url, headers=headers, json=body, timeout=120)
+            if r.status_code in (401, 403):
+                log(f"Cloudflare : accès refusé (HTTP {r.status_code}) -> vérifie CF_API_TOKEN "
+                    "(permissions Workers AI) et CF_ACCOUNT_ID. Service ignoré.", level="ERROR")
+                self._dead.add("cloudflare")
+                return None
+            if r.status_code == 429:
+                log("Cloudflare : limite atteinte (quota du jour ?) -> service ignoré.",
+                    level="WARN")
+                self._dead.add("cloudflare")
+                return None
+            r.raise_for_status()
+            data = r.json()
+            b64 = (data.get("result") or {}).get("image")
+            if not b64:
+                log(f"Cloudflare : réponse sans image : {str(data)[:300]}", level="WARN")
+                return None
+            img = Image.open(io.BytesIO(base64.b64decode(b64))).convert("RGB")
+            log(f"Cloudflare OK en {time.time() - t:.1f}s -> image {img.size[0]}x{img.size[1]}",
+                level="OK")
+            return img
+        except Exception as e:
+            log(f"Cloudflare indisponible ({type(e).__name__}) : {str(e)[:300]}", level="WARN")
+            return None
+
     def _image_hf(self, prompt, seed=None):
         token = os.getenv("HF_TOKEN", "")
         if not token:
-            print("HF_TOKEN absent : passage au fallback Pollinations.")
+            log("HF_TOKEN absent -> Hugging Face ignoré.", level="WARN")
+            return None
+        if "hf" in self._dead:
             return None
 
         model = HF_IMAGE_MODEL
@@ -240,34 +391,81 @@ class TextPost:
             {},
         ]
         for i, p in enumerate(attempts):
+            t = time.time()
             try:
+                log(f"HF essai {i + 1}/{len(attempts)} : {model} | {p}")
                 image = client.text_to_image(prompt, model=model, **p)
+                log(f"HF OK en {time.time() - t:.1f}s -> image {image.size[0]}x{image.size[1]}",
+                    level="OK")
                 return image.convert("RGB")
             except Exception as e:
-                print(f"HF essai {i + 1} échoué : {e}")
+                log(f"HF essai {i + 1} échoué en {time.time() - t:.1f}s "
+                    f"({type(e).__name__}) : {str(e)[:300]}", level="WARN")
+                if "402" in str(e) or "Payment Required" in str(e):
+                    log("HF : crédits épuisés -> service ignoré pour cette exécution.",
+                        level="WARN")
+                    self._dead.add("hf")
+                    return None
                 time.sleep(2)
+        log("HF : tous les essais ont échoué.", level="WARN")
         return None
 
     def _image_pollinations(self, prompt, seed=None):
+        if "pollinations" in self._dead:
+            return None
         seed = seed if seed is not None else int(time.time())
         url = (
             "https://image.pollinations.ai/prompt/"
             + urllib.parse.quote(prompt)
             + f"?model=flux&width={IMG_W}&height={IMG_H}&nologo=true&seed={seed}&enhance=false"
         )
+        t = time.time()
         try:
+            log("Pollinations : requête en cours (peut prendre jusqu'à 3 min)…")
             r = requests.get(url, timeout=180)
+            log(f"Pollinations : HTTP {r.status_code} | {len(r.content) // 1024} Ko "
+                f"| {time.time() - t:.1f}s")
             r.raise_for_status()
             img = Image.open(io.BytesIO(r.content)).convert("RGB")
             # Retire un éventuel bandeau/filigrane en bas
             w, h = img.size
+            log(f"Pollinations OK -> image {w}x{h}", level="OK")
             return img.crop((0, 0, w, int(h * 0.94)))
         except Exception as e:
-            print(f"Pollinations indisponible : {e}")
+            log(f"Pollinations indisponible ({type(e).__name__}) : {str(e)[:200]} "
+                "-> service ignoré pour cette exécution.", level="WARN")
+            self._dead.add("pollinations")
             return None
 
     def _generate_one(self, prompt, seed):
-        return self._image_hf(prompt, seed) or self._image_pollinations(prompt, seed)
+        services = (
+            ("Cloudflare", self._image_cloudflare),
+            ("Hugging Face", self._image_hf),
+            ("Pollinations", self._image_pollinations),
+        )
+        for nom, fonction in services:
+            img = fonction(prompt, seed)
+            if img is not None:
+                return img, nom
+            log(f"{nom} : pas d'image, service suivant…", level="WARN")
+        return None, None
+
+    @staticmethod
+    def _image_fallback_design():
+        """Dernier recours : fond graphique bleu nuit et or (le titre arabe est ajouté dessus)."""
+        w, h = IMG_W, IMG_H
+        img = Image.new("RGB", (w, h))
+        d = ImageDraw.Draw(img)
+        top, bot = (10, 30, 70), (3, 8, 22)
+        for y in range(h):
+            t = y / h
+            d.line([(0, y), (w, y)],
+                   fill=tuple(int(top[i] + (bot[i] - top[i]) * t) for i in range(3)))
+        glow = Image.new("RGB", (w, h), (0, 0, 0))
+        ImageDraw.Draw(glow).ellipse([w * 0.15, h * 0.05, w * 0.85, h * 0.55],
+                                     fill=(120, 85, 10))
+        glow = glow.filter(ImageFilter.GaussianBlur(120))
+        return ImageChops.add(img, glow)
 
     # ------------------------------------------------------------------
     # 3) Sélection du meilleur candidat
@@ -290,16 +488,23 @@ class TextPost:
 
     def _best_image(self, prompt):
         candidates = []
-        for i in range(max(1, IMAGE_CANDIDATES)):
+        n = max(1, IMAGE_CANDIDATES)
+        for i in range(n):
+            log(f"Candidat {i + 1}/{n} : génération…")
             seed = int(time.time() * 1000) % 2_000_000_000 + i * 7919
-            img = self._generate_one(prompt, seed)
+            img, source = self._generate_one(prompt, seed)
             if img is not None and img.size[0] >= 512:
                 score = self._score_image(img)
-                print(f"Candidat {i + 1} : score {score:.1f}")
+                log(f"Candidat {i + 1}/{n} : {source} | {img.size[0]}x{img.size[1]} | "
+                    f"score {score:.1f}", level="OK")
                 candidates.append((score, img))
+            else:
+                log(f"Candidat {i + 1}/{n} : aucune image exploitable.", level="WARN")
         if not candidates:
             return None
-        return max(candidates, key=lambda c: c[0])[1]
+        best = max(candidates, key=lambda c: c[0])
+        log(f"Meilleur candidat retenu (score {best[0]:.1f}).")
+        return best[1]
 
     # ------------------------------------------------------------------
     # 4) Post-traitement (netteté, couleur, vignette, grain)
@@ -386,7 +591,7 @@ class TextPost:
         try:
             return cls._open_ar_font(size, mode)
         except Exception:
-            print("ATTENTION : aucune police arabe trouvée (mets Cairo-Bold.ttf dans ./fonts/)")
+            log("ATTENTION : aucune police arabe trouvée (mets Cairo-Bold.ttf dans ./fonts/)")
             return TextPost._load_font(size)
 
     @classmethod
@@ -441,14 +646,14 @@ class TextPost:
                 if cls._ar_selftest(mode):
                     chosen = mode
                     break
-                print(f"Mode arabe '{mode}' : rendu incorrect, essai suivant.")
+                log(f"Mode arabe '{mode}' : rendu incorrect, essai suivant.")
             except Exception as e:
-                print(f"Mode arabe '{mode}' indisponible : {e}")
+                log(f"Mode arabe '{mode}' indisponible : {e}")
         if chosen is None:
             chosen = "bidi" if ARABIC_OK else "plain"
-            print("ATTENTION : aucun mode arabe validé, l'affichage peut être incorrect.")
+            log("ATTENTION : aucun mode arabe validé, l'affichage peut être incorrect.")
         cls._ar_mode = chosen
-        print(f"Mode d'écriture arabe retenu : {chosen}")
+        log(f"Mode d'écriture arabe retenu : {chosen}")
         return chosen
 
     @classmethod
@@ -525,14 +730,14 @@ class TextPost:
         """Charge imgs/logo.png (PNG transparent conseillé). None si absent."""
         try:
             if not LOGO_PATH.is_file():
-                print(f"Logo introuvable ({LOGO_PATH}) : logo texte utilisé à la place.")
+                log(f"Logo introuvable ({LOGO_PATH}) : logo texte utilisé à la place.")
                 return None
             logo = Image.open(LOGO_PATH).convert("RGBA")
             ratio = min(int(w * 0.24) / logo.width, int(h * 0.11) / logo.height)
             size = (max(1, int(logo.width * ratio)), max(1, int(logo.height * ratio)))
             return logo.resize(size, Image.LANCZOS)
         except Exception as e:
-            print(f"Logo illisible : {e}")
+            log(f"Logo illisible : {e}")
             return None
 
     def _add_branding(self, img, headline=None):
@@ -655,25 +860,31 @@ class TextPost:
     # 5) Pipeline image complet
     # ------------------------------------------------------------------
     def generer_image(self, news_original=None, headline=None):
-        print("Génération de l'image...")
+        t0 = time.time()
+        log("Image 1/5 : demande du prompt photo au LLM (Groq)…")
         prompt = self._build_prompt(news_original)
-        print("Prompt image :", prompt)
-
+        log(f"Image 2/5 : prompt final ({len(prompt.split())} mots) :")
+        log("      " + prompt)
+        log(f"Image 3/5 : génération de {max(1, IMAGE_CANDIDATES)} candidat(s)…")
         img = self._best_image(prompt)
         if img is None:
-            raise RuntimeError("Aucune image générée : publication annulée.")
+            log("Aucun générateur d'image disponible (Cloudflare, Hugging Face et "
+                "Pollinations ont échoué) -> fond graphique de secours.", level="WARN")
+            img = self._image_fallback_design()
 
-        # Même ratio (4:5) -> recadrage minimal, pas de perte de détail
+        log("Image 4/5 : recadrage 4:5, netteté, couleurs, vignette, grain…")
         img = ImageOps.fit(img, (OUT_W, OUT_H), Image.LANCZOS, centering=(0.5, 0.4))
         img = self._enhance_image(img)
+
+        log("Image 5/5 : logo + titre arabe"
+            + (f" : « {headline} »" if headline else " (aucun titre)"))
         img = self._add_branding(img, headline)
 
-        output_png = OUTPUT_DIR / "img.png"
-        img.save(output_png)
-        # JPEG haute qualité : utilisé pour Facebook et Instagram (léger, accepté partout)
+        img.save(OUTPUT_DIR / "img.png")
         output_jpg = OUTPUT_DIR / "img.jpg"
         img.save(output_jpg, format="JPEG", quality=95, optimize=True, subsampling=0)
-        print(f"Image sauvegardée : {output_jpg}")
+        log(f"Image prête : {output_jpg.name} ({output_jpg.stat().st_size // 1024} Ko, "
+            f"{img.size[0]}x{img.size[1]}) en {time.time() - t0:.0f}s", level="OK")
         return output_jpg
 
     # ------------------------------------------------------------------
@@ -681,14 +892,100 @@ class TextPost:
     # ------------------------------------------------------------------
     @staticmethod
     def _json_or_text(response):
-        if response.headers.get("content-type", "").startswith("application/json"):
-            return response.json()
-        return {"message": response.text[:1000]}
+        if "json" in response.headers.get("content-type", ""):
+            try:
+                return response.json()
+            except Exception:
+                pass
+        return {"message": response.text[:500]}
+
+    def _publier_facebook(self, chemin, caption, page_id, token):
+        log(f"Facebook : envoi de la photo ({chemin.stat().st_size // 1024} Ko)…")
+        try:
+            with chemin.open("rb") as fichier:
+                response = requests.post(
+                    f"{GRAPH_URL}/{page_id}/photos",
+                    data={"message": caption, "access_token": token},
+                    files={"source": (chemin.name, fichier, "image/jpeg")},
+                    timeout=120,
+                )
+            data = self._json_or_text(response)
+            log(f"Facebook : réponse HTTP {response.status_code}")
+            if response.ok and "error" not in data:
+                log(f"Facebook : PUBLIÉ (id={data.get('post_id') or data.get('id')})", level="OK")
+                return True
+            log("Facebook : ÉCHEC -> " + explain_graph_error(data), level="ERROR")
+        except Exception as e:
+            log(f"Facebook : exception {type(e).__name__} : {str(e)[:300]}", level="ERROR")
+        return False
+
+    def _publier_instagram(self, chemin, caption, ig_id, token, cloud):
+        try:
+            cloudinary.config(cloud_name=cloud[0], api_key=cloud[1], api_secret=cloud[2],
+                              secure=True)
+            log("Instagram 1/4 : envoi de l'image sur Cloudinary…")
+            upload = cloudinary.uploader.upload(
+                str(chemin), resource_type="image", folder="actualites_financieres"
+            )
+            image_url = upload.get("secure_url")
+            if not (image_url and image_url.startswith("https://")):
+                log(f"Instagram : Cloudinary n'a pas renvoyé d'URL valide : {upload}", level="ERROR")
+                return False
+            log(f"Instagram 1/4 : image hébergée -> {image_url}", level="OK")
+
+            log("Instagram 2/4 : création du conteneur média…")
+            r = requests.post(
+                f"{GRAPH_URL}/{ig_id}/media",
+                data={"image_url": image_url, "caption": caption[:IG_CAPTION_LIMIT],
+                      "access_token": token},
+                timeout=90,
+            )
+            data = self._json_or_text(r)
+            log(f"Instagram 2/4 : HTTP {r.status_code}")
+            if not (r.ok and "error" not in data and data.get("id")):
+                log("Instagram : ÉCHEC création -> " + explain_graph_error(data), level="ERROR")
+                return False
+            creation_id = data["id"]
+            log(f"Instagram 2/4 : conteneur créé (id={creation_id})", level="OK")
+
+            log("Instagram 3/4 : attente du traitement par Instagram…")
+            statut = None
+            for i in range(12):
+                sr = requests.get(
+                    f"{GRAPH_URL}/{creation_id}",
+                    params={"fields": "status_code", "access_token": token},
+                    timeout=30,
+                )
+                statut = sr.json().get("status_code")
+                log(f"      contrôle {i + 1}/12 : {statut}")
+                if statut in ("FINISHED", "ERROR"):
+                    break
+                time.sleep(5)
+            if statut != "FINISHED":
+                log(f"Instagram : le média n'est pas prêt (statut final : {statut})", level="ERROR")
+                return False
+
+            log("Instagram 4/4 : publication…")
+            pr = requests.post(
+                f"{GRAPH_URL}/{ig_id}/media_publish",
+                data={"creation_id": creation_id, "access_token": token},
+                timeout=90,
+            )
+            pdata = self._json_or_text(pr)
+            log(f"Instagram 4/4 : HTTP {pr.status_code}")
+            if pr.ok and "error" not in pdata:
+                log(f"Instagram : PUBLIÉ (id={pdata.get('id')})", level="OK")
+                return True
+            log("Instagram : ÉCHEC publication -> " + explain_graph_error(pdata), level="ERROR")
+        except Exception as e:
+            log(f"Instagram : exception {type(e).__name__} : {str(e)[:300]}", level="ERROR")
+        return False
 
     def publier_texte_partout(self, news_original, news_translited, headline=None):
-        resultats = {"image": None, "facebook": False, "instagram": False}
+        resultats = {"image": None, "facebook": False, "instagram": False, "erreur": None}
 
         try:
+            log("── Génération de l'image ──", level="STEP")
             chemin = Path(self.generer_image(news_original=news_original, headline=headline))
             if not chemin.is_file():
                 raise FileNotFoundError(f"Image générée introuvable : {chemin.resolve()}")
@@ -697,93 +994,32 @@ class TextPost:
             page_id = os.getenv("PAGE_ID", "")
             token = os.getenv("PAGE_ACCESS_TOKEN", "")
             ig_id = os.getenv("INSTAGRAM_BUSINESS_ID", "")
-
-            cloud_name = os.getenv("CLOUDINARY_CLOUD_NAME", "")
-            cloud_key = os.getenv("CLOUDINARY_API_KEY", "")
-            cloud_secret = os.getenv("CLOUDINARY_API_SECRET", "")
-
+            cloud = (os.getenv("CLOUDINARY_CLOUD_NAME", ""), os.getenv("CLOUDINARY_API_KEY", ""),
+                     os.getenv("CLOUDINARY_API_SECRET", ""))
             if not token:
-                raise ValueError("PAGE_ACCESS_TOKEN est absent.")
+                raise ValueError("PAGE_ACCESS_TOKEN est absent (secret non transmis au job ?)")
 
-            # ---------------- Facebook ----------------
+            log("── Publication Facebook ──", level="STEP")
             if page_id:
-                try:
-                    with chemin.open("rb") as fichier:
-                        response = requests.post(
-                            f"{GRAPH_URL}/{page_id}/photos",
-                            data={"message": news_translited, "access_token": token},
-                            files={"source": (chemin.name, fichier, "image/jpeg")},
-                            timeout=120,
-                        )
-                    data_fb = self._json_or_text(response)
-                    if response.ok and "error" not in data_fb:
-                        resultats["facebook"] = True
-                        print("Facebook : publication réussie.")
-                    else:
-                        print("Facebook : échec :", data_fb)
-                except Exception as erreur:
-                    print("Erreur Facebook :", erreur)
+                resultats["facebook"] = self._publier_facebook(chemin, news_translited,
+                                                               page_id, token)
+            else:
+                log("Facebook IGNORÉ : PAGE_ID est vide.", level="WARN")
 
-            # ---------------- Instagram ----------------
-            if all([cloud_name, cloud_key, cloud_secret]) and ig_id:
-                try:
-                    cloudinary.config(
-                        cloud_name=cloud_name,
-                        api_key=cloud_key,
-                        api_secret=cloud_secret,
-                        secure=True,
-                    )
-                    upload = cloudinary.uploader.upload(
-                        str(chemin), resource_type="image", folder="actualites_financieres"
-                    )
-                    image_url = upload.get("secure_url")
-
-                    if image_url and image_url.startswith("https://"):
-                        caption = news_translited[:IG_CAPTION_LIMIT]
-                        creation_response = requests.post(
-                            f"{GRAPH_URL}/{ig_id}/media",
-                            data={"image_url": image_url, "caption": caption,
-                                  "access_token": token},
-                            timeout=90,
-                        )
-                        creation_data = self._json_or_text(creation_response)
-
-                        if (creation_response.ok and "error" not in creation_data
-                                and creation_data.get("id")):
-                            creation_id = creation_data["id"]
-                            statut = None
-                            for _ in range(12):
-                                statut_response = requests.get(
-                                    f"{GRAPH_URL}/{creation_id}",
-                                    params={"fields": "status_code", "access_token": token},
-                                    timeout=30,
-                                )
-                                statut = statut_response.json().get("status_code")
-                                if statut in ("FINISHED", "ERROR"):
-                                    break
-                                time.sleep(5)
-
-                            if statut == "FINISHED":
-                                pub_response = requests.post(
-                                    f"{GRAPH_URL}/{ig_id}/media_publish",
-                                    data={"creation_id": creation_id, "access_token": token},
-                                    timeout=90,
-                                )
-                                pub_data = self._json_or_text(pub_response)
-                                if pub_response.ok and "error" not in pub_data:
-                                    resultats["instagram"] = True
-                                    print("Instagram : publication réussie.")
-                                else:
-                                    print("Instagram : échec publication :", pub_data)
-                            else:
-                                print("Instagram : statut du média :", statut)
-                        else:
-                            print("Instagram : échec création média :", creation_data)
-                except Exception as erreur:
-                    print("Erreur Instagram :", erreur)
-
-        except Exception as erreur:
-            print("Erreur de génération ou de préparation :", erreur)
+            log("── Publication Instagram ──", level="STEP")
+            manque = [n for n, v in (("INSTAGRAM_BUSINESS_ID", ig_id),
+                                     ("CLOUDINARY_CLOUD_NAME", cloud[0]),
+                                     ("CLOUDINARY_API_KEY", cloud[1]),
+                                     ("CLOUDINARY_API_SECRET", cloud[2])) if not v]
+            if manque:
+                log("Instagram IGNORÉ : variable(s) vide(s) -> " + ", ".join(manque), level="WARN")
+            else:
+                resultats["instagram"] = self._publier_instagram(chemin, news_translited,
+                                                                 ig_id, token, cloud)
+        except Exception as e:
+            resultats["erreur"] = f"{type(e).__name__}: {e}"
+            log(f"Échec de la génération/préparation : {resultats['erreur']}", level="ERROR")
+            log(traceback.format_exc(limit=4))
 
         return resultats
 
@@ -794,7 +1030,8 @@ class TextPost:
 class Extract_post:
     def __init__(self):
         self.model_groq_name = GROQ_MODEL
-        self.client = Groq(api_key=os.getenv("TOKEN_AI_DESCRYB_IMG", ""))
+        self.client = Groq(api_key=os.getenv("TOKEN_AI_DESCRYB_IMG", ""), timeout=60,
+                           max_retries=1)
         self.TRUSTED_WEB_SOURCES = TRUSTED_WEB_SOURCES
 
     def clean_html(self, text):
@@ -815,13 +1052,37 @@ class Extract_post:
     def fetch_all_news(self):
         articles = []
         seen_links = set()
+        headers = {
+            # Beaucoup de sites bloquent le User-Agent par défaut de feedparser/GitHub
+            "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                           "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"),
+            "Accept": "application/rss+xml, application/xml, text/xml, */*",
+        }
 
         for source_name, feed_url in self.TRUSTED_WEB_SOURCES.items():
+            t = time.time()
+            log(f"[{source_name}] lecture de {feed_url}")
             try:
-                feed = feedparser.parse(feed_url)
-                if getattr(feed, "status", 200) >= 400:
+                resp = requests.get(feed_url, headers=headers, timeout=30)
+                log(f"[{source_name}] HTTP {resp.status_code} | {len(resp.content) // 1024} Ko | "
+                    f"{resp.headers.get('content-type', '?')} | {time.time() - t:.1f}s")
+                if resp.status_code >= 400:
+                    log(f"[{source_name}] flux INACCESSIBLE. Début de la réponse : "
+                        f"{resp.text[:150]!r}", level="WARN")
+                    STATS["flux_ko"] += 1
                     continue
 
+                feed = feedparser.parse(resp.content)
+                if getattr(feed, "bozo", 0):
+                    log(f"[{source_name}] XML imparfait : "
+                        f"{str(getattr(feed, 'bozo_exception', ''))[:150]}", level="WARN")
+                if not feed.entries:
+                    log(f"[{source_name}] 0 article dans le flux (page de blocage ?). "
+                        f"Début de la réponse : {resp.text[:150]!r}", level="WARN")
+                    STATS["flux_ko"] += 1
+                    continue
+
+                ajoutes = 0
                 for entry in feed.entries:
                     link = entry.get("link", "").strip()
                     title = entry.get("title", "").strip()
@@ -845,6 +1106,7 @@ class Extract_post:
                         continue
 
                     seen_links.add(link)
+                    ajoutes += 1
                     articles.append({
                         "source": source_name,
                         "title": self.clean_html(title),
@@ -852,11 +1114,28 @@ class Extract_post:
                         "continue": clean_text,
                         "datetime": publication_datetime,
                     })
+                log(f"[{source_name}] {ajoutes} article(s) retenu(s) sur {len(feed.entries)}",
+                    level="OK")
+                STATS["flux_ok"] += 1
             except Exception as error:
-                print(f"Erreur pour {source_name}: {error}")
+                log(f"[{source_name}] erreur {type(error).__name__} : {str(error)[:300]}",
+                    level="ERROR")
+                STATS["flux_ko"] += 1
 
         articles.sort(key=lambda item: item["datetime"], reverse=True)
         return articles
+
+    @staticmethod
+    def _extract_json(text):
+        """Extrait l'objet JSON d'une réponse LLM (gère <think>…</think> et ```json)."""
+        text = re.sub(r"<think>.*?</think>", "", text or "", flags=re.S | re.I).strip()
+        try:
+            return json.loads(text)
+        except Exception:
+            m = re.search(r"\{.*\}", text, re.S)
+            if m:
+                return json.loads(m.group(0))
+            raise
 
     def tradication_of_text(self, text):
         prompt = """
@@ -868,6 +1147,8 @@ class Extract_post:
         The headline: 8 to 15 words, newsroom style, captures the key fact (and the
         market impact if any), no emojis, no hashtags, no quotation marks, no source name.
         """
+        t = time.time()
+        log(f"Traduction en arabe (Groq, modèle {self.model_groq_name})…")
         try:
             response = self.client.chat.completions.create(
                 model=self.model_groq_name,
@@ -878,94 +1159,323 @@ class Extract_post:
                 temperature=0.0,
                 response_format={"type": "json_object"},
             )
-            return json.loads(response.choices[0].message.content)
+            data = self._extract_json(response.choices[0].message.content)
+            log(f"Traduction reçue en {time.time() - t:.1f}s", level="OK")
+            return data
         except Exception as e:
-            print(f"Erreur lors de l'appel Groq : {e}")
+            log(f"Traduction ÉCHOUÉE ({type(e).__name__}) : {str(e)[:400]}", level="ERROR")
+            if "model" in str(e).lower() and ("not" in str(e).lower() or "exist" in str(e).lower()):
+                log("   -> le modèle Groq n'existe pas / n'est plus disponible : "
+                    "change la variable GROQ_MODEL.", level="WARN")
             return None
 
 
 # ======================================================================
 # MAIN
 # ======================================================================
+GROQ_FALLBACKS = ("qwen/qwen3-32b", "llama-3.3-70b-versatile", "openai/gpt-oss-120b",
+                  "llama-3.1-8b-instant")
+TOTAL_STEPS = 6
+
+
 def charger_historique(fichier_json):
     if os.path.exists(fichier_json):
         try:
             with open(fichier_json, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            return data if isinstance(data, dict) else {}
-        except Exception:
+            data = data if isinstance(data, dict) else {}
+            log(f"Historique : {len(data)} news déjà publiées ({os.path.basename(fichier_json)})")
+            if IS_GHA and not data:
+                log("Historique VIDE sur GitHub Actions : le fichier doit être commité après "
+                    "chaque run, sinon les mêmes news seront republiées.", level="WARN")
+            return data
+        except Exception as e:
+            log(f"Historique illisible ({e}) : repart de zéro.", level="WARN")
             return {}
+    log("Historique : fichier absent -> création (premier lancement).", level="WARN")
     with open(fichier_json, "w", encoding="utf-8") as f:
         json.dump({}, f, ensure_ascii=False, indent=4)
     return {}
+
+
+def diagnostic_environnement():
+    """Affiche la config + la présence des secrets (jamais leur valeur). Renvoie les manquants."""
+    log(f"Python {sys.version.split()[0]} | Pillow {PIL.__version__} | "
+        f"GitHub Actions : {'oui' if IS_GHA else 'non'}")
+    log(f"Heure UTC : {datetime.now(timezone.utc):%Y-%m-%d %H:%M:%S}")
+    log(f"Réglages : Groq={GROQ_MODEL} | image CF={CF_IMAGE_MODEL} | image HF={HF_IMAGE_MODEL} | "
+        f"candidats={IMAGE_CANDIDATES} | max posts={MAX_POSTS_PER_RUN} | "
+        f"max tentatives={MAX_ATTEMPTS_PER_RUN} | âge max={MAX_NEWS_AGE_HOURS}h | "
+        f"Graph={GRAPH_URL.rsplit('/', 1)[-1]}")
+
+    variables = [
+        ("TOKEN_AI_DESCRYB_IMG", True, "Groq (traduction + prompt image)"),
+        ("PAGE_ACCESS_TOKEN", True, "token Meta (Facebook + Instagram)"),
+        ("CF_ACCOUNT_ID", False, "Cloudflare Workers AI (images FLUX gratuites)"),
+        ("CF_API_TOKEN", False, "Cloudflare Workers AI (images FLUX gratuites)"),
+        ("HF_TOKEN", False, "Hugging Face (images FLUX) -> secours"),
+        ("PAGE_ID", False, "ID de la page Facebook -> sinon Facebook ignoré"),
+        ("INSTAGRAM_BUSINESS_ID", False, "ID Instagram -> sinon Instagram ignoré"),
+        ("CLOUDINARY_CLOUD_NAME", False, "Cloudinary (requis pour Instagram)"),
+        ("CLOUDINARY_API_KEY", False, "Cloudinary (requis pour Instagram)"),
+        ("CLOUDINARY_API_SECRET", False, "Cloudinary (requis pour Instagram)"),
+    ]
+    manquants = []
+    for nom, obligatoire, role in variables:
+        if os.getenv(nom, ""):
+            log(f"{nom:<24} présent        | {role}", level="OK")
+        else:
+            log(f"{nom:<24} ABSENT/VIDE     | {role}", level="ERROR" if obligatoire else "WARN")
+            if obligatoire:
+                manquants.append(nom)
+    if IS_GHA:
+        log("   (un secret n'est visible du script que s'il est listé dans 'env:' du workflow)")
+
+    log(f"Logo : {'trouvé' if LOGO_PATH.is_file() else 'ABSENT'} ({LOGO_PATH})",
+        level="OK" if LOGO_PATH.is_file() else "WARN")
+    police = next((p for p in TextPost._ar_font_candidates() if p and os.path.exists(p)), None)
+    log(f"Police arabe : {police or 'AUCUNE (arabe illisible !)'}",
+        level="OK" if police else "ERROR")
+    log(f"Arabe : bibliothèques {'présentes' if ARABIC_OK else 'ABSENTES (pip install arabic-reshaper python-bidi)'}",
+        level="OK" if ARABIC_OK else "WARN")
+    TextPost._detect_ar_mode()
+    return manquants
+
+
+def resoudre_modele_groq():
+    """Vérifie que le modèle Groq existe ; sinon bascule sur un modèle disponible."""
+    global GROQ_MODEL
+    try:
+        client = Groq(api_key=os.getenv("TOKEN_AI_DESCRYB_IMG", ""), timeout=30, max_retries=1)
+        ids = sorted(m.id for m in client.models.list().data)
+    except Exception as e:
+        log(f"Groq inaccessible ({type(e).__name__}) : {str(e)[:300]}", level="ERROR")
+        log("   -> clé TOKEN_AI_DESCRYB_IMG invalide, ou réseau bloqué.", level="WARN")
+        return False
+    log(f"Groq : clé valide, {len(ids)} modèles disponibles", level="OK")
+    if GROQ_MODEL in ids:
+        log(f"Groq : modèle '{GROQ_MODEL}' disponible", level="OK")
+        return True
+    log(f"Le modèle Groq '{GROQ_MODEL}' N'EXISTE PAS.", level="ERROR")
+    log("   Modèles disponibles : " + ", ".join(ids))
+    for cand in GROQ_FALLBACKS:
+        if cand in ids:
+            GROQ_MODEL = cand
+            log(f"   -> bascule automatique sur '{cand}' (fixe GROQ_MODEL pour le garder)",
+                level="WARN")
+            return True
+    return False
+
+
+def verifier_meta():
+    """Teste les tokens Meta AVANT de générer des images. Renvoie (facebook_ok, instagram_ok)."""
+    token = os.getenv("PAGE_ACCESS_TOKEN", "")
+    page_id, ig_id = os.getenv("PAGE_ID", ""), os.getenv("INSTAGRAM_BUSINESS_ID", "")
+    fb_ok = ig_ok = False
+
+    def appel(obj_id, champs):
+        r = requests.get(f"{GRAPH_URL}/{obj_id}", params={"fields": champs, "access_token": token},
+                         timeout=30)
+        try:
+            return r.status_code, r.json()
+        except Exception:
+            return r.status_code, {"message": r.text[:300]}
+
+    if page_id:
+        try:
+            code, data = appel(page_id, "id,name")
+            if code == 200 and "error" not in data:
+                log(f"Facebook : accès OK à la page « {data.get('name')} » (id {data.get('id')})",
+                    level="OK")
+                fb_ok = True
+            else:
+                log("Facebook : accès REFUSÉ -> " + explain_graph_error(data), level="ERROR")
+        except Exception as e:
+            log(f"Facebook : test impossible ({type(e).__name__}) : {str(e)[:200]}", level="ERROR")
+    if ig_id:
+        try:
+            code, data = appel(ig_id, "id,username")
+            if code == 200 and "error" not in data:
+                log(f"Instagram : accès OK au compte @{data.get('username')}", level="OK")
+                ig_ok = True
+            else:
+                log("Instagram : accès REFUSÉ -> " + explain_graph_error(data), level="ERROR")
+        except Exception as e:
+            log(f"Instagram : test impossible ({type(e).__name__}) : {str(e)[:200]}", level="ERROR")
+    return fb_ok, ig_ok
+
+
+def ecrire_resume(statut):
+    lignes = [
+        f"## Agent Facebook / Instagram — {statut}",
+        "",
+        "| Indicateur | Valeur |", "|---|---|",
+        f"| Flux RSS OK / en échec | {STATS['flux_ok']} / {STATS['flux_ko']} |",
+        f"| News récupérées | {STATS['news_total']} |",
+        f"| Déjà publiées | {STATS['deja']} |",
+        f"| Trop anciennes (> {MAX_NEWS_AGE_HOURS} h) | {STATS['anciennes']} |",
+        f"| À publier | {STATS['candidates']} |",
+        f"| Tentatives | {STATS['tentatives']} |",
+        f"| **Publiées** | **{STATS['publies']}** |",
+    ]
+    if STATS["echecs"]:
+        lignes += ["", "### Échecs"]
+        lignes += [f"- {t[:80]} — {raison}" for t, raison in STATS["echecs"]]
+    step_summary("\n".join(lignes))
+
+
+def terminer(code, statut):
+    faulthandler.cancel_dump_traceback_later()
+    banner(6, TOTAL_STEPS, "RÉSUMÉ")
+    log(f"Flux OK : {STATS['flux_ok']} | Flux en échec : {STATS['flux_ko']} | "
+        f"News : {STATS['news_total']} | Déjà publiées : {STATS['deja']} | "
+        f"Trop anciennes : {STATS['anciennes']} | À publier : {STATS['candidates']}")
+    log(f"Tentatives : {STATS['tentatives']} | PUBLIÉES : {STATS['publies']}",
+        level="OK" if STATS["publies"] else "WARN")
+    for titre, raison in STATS["echecs"]:
+        log(f"   échec : {titre[:70]} -> {raison}", level="ERROR")
+    log(f"Durée totale : {time.time() - T0:.0f}s | Résultat : {statut} (code de sortie {code})",
+        level="OK" if code == 0 else "ERROR")
+    ecrire_resume(statut)
+    sys.exit(code)
 
 
 def main():
     base_dir = os.path.dirname(os.path.abspath(__file__))
     fichier_json = os.path.join(base_dir, "historique_posts.json")
 
+    # ---------------- ÉTAPE 1 : environnement ----------------
+    banner(1, TOTAL_STEPS, "Configuration et environnement")
+    manquants = diagnostic_environnement()
+    if manquants:
+        log("Variables obligatoires manquantes : " + ", ".join(manquants), level="ERROR")
+        log("   -> ajoute-les dans Settings > Secrets ET dans la section 'env:' du workflow.")
+        STATS["echecs"].append(("Démarrage", "secrets manquants : " + ", ".join(manquants)))
+        terminer(1, "ÉCHEC (configuration)")
+
+    # ---------------- ÉTAPE 2 : accès aux services ----------------
+    banner(2, TOTAL_STEPS, "Vérification des accès (Groq, Facebook, Instagram)")
+    if not resoudre_modele_groq():
+        STATS["echecs"].append(("Groq", "clé invalide ou aucun modèle utilisable"))
+        terminer(1, "ÉCHEC (Groq)")
+    fb_ok, ig_ok = verifier_meta()
+    if not (fb_ok or ig_ok):
+        log("Aucune destination utilisable (Facebook et Instagram refusés) : arrêt, inutile de "
+            "générer des images.", level="ERROR")
+        STATS["echecs"].append(("Meta", "token/ID refusés par l'API Graph"))
+        terminer(1, "ÉCHEC (Meta)")
+
     extract_post = Extract_post()
     text_post = TextPost()
-    historique = charger_historique(fichier_json)
 
+    # ---------------- ÉTAPE 3 : flux RSS ----------------
+    banner(3, TOTAL_STEPS, "Lecture des flux RSS")
     all_news = extract_post.fetch_all_news()
-    now = datetime.now(timezone.utc)
-    publies = 0
-    tentatives = 0
+    STATS["news_total"] = len(all_news)
+    if not all_news:
+        log("AUCUNE news récupérée : les 3 flux sont bloqués ou vides (voir lignes ci-dessus).",
+            level="ERROR")
+        STATS["echecs"].append(("Flux RSS", "aucune news récupérée"))
+        terminer(1, "ÉCHEC (aucune news)")
 
-    for news in all_news:
-        if publies >= MAX_POSTS_PER_RUN or tentatives >= MAX_ATTEMPTS_PER_RUN:
+    # ---------------- ÉTAPE 4 : sélection ----------------
+    banner(4, TOTAL_STEPS, "Sélection des news à publier")
+    historique = charger_historique(fichier_json)
+    now = datetime.now(timezone.utc)
+    candidates = []
+    for i, news in enumerate(all_news):
+        post_id = f"{news['source']}_{news['title']}_{news['date']}"
+        age_h = (now - news["datetime"]).total_seconds() / 3600
+        if post_id in historique:
+            statut = "déjà publiée"
+            STATS["deja"] += 1
+        elif age_h > MAX_NEWS_AGE_HOURS:
+            statut = f"trop ancienne ({age_h:.0f} h)"
+            STATS["anciennes"] += 1
+        else:
+            statut = "À PUBLIER"
+            candidates.append((news, post_id))
+        if i < 15:
+            log(f"[{i + 1:02d}] {news['source'][:22]:<22} {news['date']} ({age_h:5.1f} h) "
+                f"{statut:<22} | {news['title'][:60]}")
+    STATS["candidates"] = len(candidates)
+    log(f"Bilan : {len(all_news)} news | {STATS['deja']} déjà publiées | "
+        f"{STATS['anciennes']} trop anciennes | {len(candidates)} à publier",
+        level="OK" if candidates else "WARN")
+
+    if not candidates:
+        if STATS["deja"] and not STATS["anciennes"]:
+            log("Rien de nouveau : toutes les news récentes sont déjà publiées.")
+        elif STATS["anciennes"]:
+            log(f"Toutes les news non publiées ont plus de {MAX_NEWS_AGE_HOURS} h : "
+                "augmente MAX_NEWS_AGE_HOURS si tu veux les publier.", level="WARN")
+        terminer(0, "RIEN À PUBLIER")
+
+    # ---------------- ÉTAPE 5 : publication ----------------
+    banner(5, TOTAL_STEPS, "Traduction, image et publication")
+    for k, (news, post_id) in enumerate(candidates, 1):
+        if STATS["publies"] >= MAX_POSTS_PER_RUN:
+            log(f"Limite atteinte ({MAX_POSTS_PER_RUN} publication(s) par exécution).")
+            break
+        if STATS["tentatives"] >= MAX_ATTEMPTS_PER_RUN:
+            log(f"Limite de tentatives atteinte ({MAX_ATTEMPTS_PER_RUN}).", level="WARN")
             break
 
-        vrai_source = news["source"]
-        title = news["title"]
-        content = news["continue"]
-        date = news["date"]
-        post_id = f"{vrai_source}_{title}_{date}"
+        STATS["tentatives"] += 1
+        title, content, date, src = news["title"], news["continue"], news["date"], news["source"]
+        log(f"━━ News {k}/{len(candidates)} (tentative {STATS['tentatives']}/{MAX_ATTEMPTS_PER_RUN}) ━━",
+            level="STEP")
+        log(f"Source : {src} | Date : {date}")
+        log(f"Titre  : {title}")
+        log(f"Texte  : {len(content)} caractères")
 
-        if post_id in historique:
-            print(f"Déjà traité : {title}")
-            continue
-
-        age_h = (now - news["datetime"]).total_seconds() / 3600
-        if age_h > MAX_NEWS_AGE_HOURS:
-            print(f"Trop ancienne ({age_h:.0f} h) : {title}")
-            continue
-
-        text_original = f"{title}\n{content}\n\nsource: {vrai_source}, date: {date}"
+        text_original = f"{title}\n{content}\n\nsource: {src}, date: {date}"
         text_translated = extract_post.tradication_of_text(text_original)
 
-        # Correction du bug "None" publié comme légende
         if not isinstance(text_translated, dict):
-            print("Traduction échouée, on passe.")
+            STATS["echecs"].append((title, "traduction échouée"))
             continue
         caption = str(text_translated.get("caption") or "").strip()
         if not caption:
-            print("Traduction vide, on passe.")
+            log(f"Traduction sans 'caption' : {str(text_translated)[:200]}", level="ERROR")
+            STATS["echecs"].append((title, "traduction vide"))
             continue
-
         headline = str(text_translated.get("headline") or "").strip()
         if not headline:  # secours : début de la légende
             headline = " ".join(caption.split()[:14])
+            log("Pas de titre court renvoyé : début de la légende utilisé.", level="WARN")
+        log(f"Titre arabe : {headline}")
+        log(f"Légende     : {len(caption)} caractères")
 
-        tentatives += 1
-        try:
-            resultat = text_post.publier_texte_partout(text_original, caption, headline)
+        resultat = text_post.publier_texte_partout(text_original, caption, headline)
 
-            if resultat and (resultat.get("facebook") or resultat.get("instagram")):
-                historique[post_id] = {"source": vrai_source, "titre": title, "date": date}
-                with open(fichier_json, "w", encoding="utf-8") as f:
-                    json.dump(historique, f, ensure_ascii=False, indent=4)
-                publies += 1
-                print(f"Historique sauvegardé : {title}")
-            else:
-                print(f"Publication non confirmée : {title}.")
-        except Exception as e:
-            print(f"Erreur publication de '{title}' : {e}")
-            continue
+        if resultat.get("facebook") or resultat.get("instagram"):
+            historique[post_id] = {"source": src, "titre": title, "date": date}
+            with open(fichier_json, "w", encoding="utf-8") as f:
+                json.dump(historique, f, ensure_ascii=False, indent=4)
+            STATS["publies"] += 1
+            log(f"PUBLIÉ (Facebook : {'oui' if resultat['facebook'] else 'non'} | "
+                f"Instagram : {'oui' if resultat['instagram'] else 'non'}) -> historique mis à jour",
+                level="OK")
+        else:
+            raison = resultat.get("erreur") or "Facebook et Instagram n'ont pas confirmé (voir ❌ ci-dessus)"
+            STATS["echecs"].append((title, raison))
+            log(f"NON PUBLIÉ : {raison}", level="ERROR")
 
-    print(f"Fin de cette exécution ({publies} publication(s)).")
+    # ---------------- ÉTAPE 6 : résumé ----------------
+    if STATS["publies"] > 0:
+        terminer(0, "SUCCÈS")
+    terminer(1, "ÉCHEC (rien n'a été publié)")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except SystemExit:
+        raise
+    except BaseException as exc:
+        log(f"ERREUR INATTENDUE : {type(exc).__name__} : {exc}", level="ERROR")
+        print(traceback.format_exc(), flush=True)
+        STATS["echecs"].append(("Erreur inattendue", f"{type(exc).__name__}: {exc}"))
+        ecrire_resume("CRASH")
+        sys.exit(1)
