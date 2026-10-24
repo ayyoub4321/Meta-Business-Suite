@@ -2,7 +2,7 @@ name: Agent Facebook Instagram
 
 on:
   schedule:
-    - cron: "0 */3 * * *"   # toutes les 3 heures (modifie selon ton besoin)
+    - cron: "0 * * * *"   # toutes les 3 heures (modifie selon ton besoin)
   workflow_dispatch:         # lancement manuel depuis l'onglet Actions
 
 permissions:
