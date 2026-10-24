@@ -617,22 +617,40 @@ import json
 import time
 
 
+
+import os
+import json
+import time
+
+
 def main():
-    fichier_json = "historique_posts.json"
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    fichier_json = os.path.join(base_dir, "historique_posts.json")
+
     extract_post = Extract_post()
     text_post = TextPost()
 
     historique = {}
 
     if os.path.exists(fichier_json):
-        with open(fichier_json, "r", encoding="utf-8") as f:
-            try:
+        try:
+            with open(fichier_json, "r", encoding="utf-8") as f:
                 historique = json.load(f)
-            except json.JSONDecodeError:
+
+            if not isinstance(historique, dict):
                 historique = {}
 
+        except (json.JSONDecodeError, OSError) as e:
+            print(f"Erreur lecture historique JSON : {e}")
+            historique = {}
+
+    else:
+        with open(fichier_json, "w", encoding="utf-8") as f:
+            json.dump({}, f, ensure_ascii=False, indent=4)
+
+    print("JSON PATH:", fichier_json)
+
     fetch_all_news = extract_post.fetch_all_news()
-    changement_detecte = False
 
     for source, news in fetch_all_news.items():
         vrai_source = source.split("_")[0]
@@ -651,34 +669,58 @@ def main():
             f"source: {vrai_source}, date: {date}"
         )
 
-        text_transleted = extract_post.tradication_of_text(text_original)
-
-        if isinstance(text_transleted, dict):
-            text_transleted_net = " ".join(
-                str(value) for value in text_transleted.values()
-            )
-        else:
-            text_transleted_net = str(text_transleted)
-
-        text_post.publier_texte_partout(
-            text_original, text_transleted_net
+        text_translated = extract_post.tradication_of_text(
+            text_original
         )
 
-        historique[post_id] = {
-            "source": vrai_source,
-            "titre": title,
-            "date": date
-        }
-        changement_detecte = True
-        
-        if changement_detecte:
-            with open(fichier_json, "w", encoding="utf-8") as f:
-                json.dump(historique, f, ensure_ascii=False, indent=4)
-        
-        print("JSON PATH:", os.path.abspath(fichier_json))
+        if isinstance(text_translated, dict):
+            text_translated_net = " ".join(
+                str(value)
+                for value in text_translated.values()
+            )
+        else:
+            text_translated_net = str(text_translated)
+
+        try:
+            resultat = text_post.publier_texte_partout(
+                text_original,
+                text_translated_net
+            )
+
+            # لا نسجلو الخبر كمنشور إلا إذا تأكد نجاح النشر.
+            # خاص publier_texte_partout ترجع نتيجة واضحة.
+            if resultat:
+                historique[post_id] = {
+                    "source": vrai_source,
+                    "titre": title,
+                    "date": date
+                }
+
+                with open(fichier_json, "w", encoding="utf-8") as f:
+                    json.dump(
+                        historique,
+                        f,
+                        ensure_ascii=False,
+                        indent=4
+                    )
+
+                print(f"Historique sauvegardé : {title}")
+            else:
+                print(
+                    f"Publication non confirmée : {title}. "
+                    "L'article reste à réessayer."
+                )
+
+        except Exception as e:
+            print(f"Erreur publication de '{title}' : {e}")
+            continue
         break
-    
     print("Fin de cette exécution.")
+
+
+if __name__ == "__main__":
+    main()
+
     
 
 
