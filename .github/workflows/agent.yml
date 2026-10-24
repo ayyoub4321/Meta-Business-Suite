@@ -1,11 +1,18 @@
-name: Test Backend Python
+
+name: Finance News Agent
 
 on:
   workflow_dispatch:
+  schedule:
+    - cron: "0 8 * * *"
+
+permissions:
+  contents: read
 
 jobs:
-  test:
+  run-agent:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     steps:
       - name: Recuperer le code
@@ -16,11 +23,18 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Verifier Python
-        run: python --version
-
-      - name: Verifier les fichiers du projet
+      - name: Installer les dependances
         run: |
-          test -f agent_facebook.py
-          test -f requirements.txt
-          echo "Les fichiers principaux du backend sont presents."
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Executer le bot
+        env:
+          TOKEN_AI_DESCRYB_IMG: ${{ secrets.TOKEN_AI_DESCRYB_IMG }}
+          PAGE_ID: ${{ secrets.PAGE_ID }}
+          PAGE_ACCESS_TOKEN: ${{ secrets.PAGE_ACCESS_TOKEN }}
+          INSTAGRAM_BUSINESS_ID: ${{ secrets.INSTAGRAM_BUSINESS_ID }}
+          CLOUDINARY_CLOUD_NAME: ${{ secrets.CLOUDINARY_CLOUD_NAME }}
+          CLOUDINARY_API_KEY: ${{ secrets.CLOUDINARY_API_KEY }}
+          CLOUDINARY_API_SECRET: ${{ secrets.CLOUDINARY_API_SECRET }}
+        run: python -u agent_facebook.py
