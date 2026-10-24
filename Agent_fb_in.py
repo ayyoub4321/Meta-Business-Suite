@@ -89,7 +89,7 @@ def _find_logo():
         p = BASE_DIR / "imgs" / name
         if p.is_file():
             return p
-    return BASE_DIR / "imgs" / "logo.png"
+    return BASE_DIR / "imgs" / "logo.jpg"
 
 
 LOGO_PATH = _find_logo()
