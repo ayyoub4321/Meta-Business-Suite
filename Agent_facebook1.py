@@ -12,7 +12,7 @@ import feedparser
 import cloudinary
 import cloudinary.uploader
 from bs4 import BeautifulSoup
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont, ImageOps
 from groq import Groq
 from langchain_groq import ChatGroq
 from huggingface_hub import InferenceClient
@@ -26,6 +26,15 @@ TRUSTED_WEB_SOURCES = {
 GROQ_MODEL = "qwen/qwen3.8-27b"
 HF_IMAGE_MODEL = "black-forest-labs/FLUX.1-schnell"
 GRAPH_URL = "https://graph.facebook.com/v26.0"
+
+# Génération en portrait (rendu optimal sur Facebook et Instagram)
+IMG_W, IMG_H = 1024, 1280      # taille demandée au modèle
+OUT_W, OUT_H = 1080, 1350      # taille finale publiée (ratio 4:5)
+
+# Identité de la page
+BRAND_NAME = ("Money", ".impact")
+BRAND_HANDLE = "@money.impact.today"
+BRAND_ACCENT = (255, 196, 0)   # or
 
 BASE_DIR = Path(__file__).resolve().parent if "__file__" in globals() else Path.cwd()
 OUTPUT_DIR = BASE_DIR / "output"
@@ -64,6 +73,8 @@ class TextPost:
         The first words must name that main subject. Max 50 words.
         No text, no letters, no logos, no people, no faces, no abstract shapes,
         no leather, no wood, no generic office props.
+        Composition: one strong hero subject in the foreground, relevant blurred background,
+        deep blue and gold color palette, bottom 20% of the frame darker and uncluttered.
         End with: photorealistic, 85mm lens, natural cinematic lighting, sharp focus.
 
         OUTPUT ONLY this format:
@@ -111,7 +122,11 @@ class TextPost:
             return None
         try:
             client = InferenceClient(api_key=token)
-            image = client.text_to_image(prompt, model=HF_IMAGE_MODEL)
+            model = os.getenv("HF_IMAGE_MODEL", HF_IMAGE_MODEL)
+            try:
+                image = client.text_to_image(prompt, model=model, width=IMG_W, height=IMG_H)
+            except Exception:
+                image = client.text_to_image(prompt, model=model)
             return image.convert("RGB")
         except Exception as e:
             print(f"HF inference indisponible : {e}")
@@ -121,15 +136,79 @@ class TextPost:
         url = (
             "https://image.pollinations.ai/prompt/"
             + urllib.parse.quote(prompt)
-            + f"?model=flux&width=1024&height=1024&nologo=true&seed={int(time.time())}"
+            + f"?model=flux&width={IMG_W}&height={IMG_H}&nologo=true&seed={int(time.time())}"
         )
         try:
             r = requests.get(url, timeout=120)
             r.raise_for_status()
-            return Image.open(io.BytesIO(r.content)).convert("RGB")
+            img = Image.open(io.BytesIO(r.content)).convert("RGB")
+            # Retire le bandeau/filigrane Pollinations en bas de l'image
+            w, h = img.size
+            return img.crop((0, 0, w, int(h * 0.94)))
         except Exception as e:
             print(f"Pollinations indisponible : {e}")
             return None
+
+    @staticmethod
+    def _load_font(size):
+        candidates = [
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+            "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf",
+        ]
+        for chemin in candidates:
+            if os.path.exists(chemin):
+                return ImageFont.truetype(chemin, size)
+        try:
+            return ImageFont.load_default(size=size)
+        except TypeError:
+            return ImageFont.load_default()
+
+    def _add_branding(self, img):
+        """Ajoute le nom de la page (net, jamais déformé comme avec une IA)."""
+        img = img.convert("RGBA")
+        w, h = img.size
+
+        # Dégradé sombre en bas pour la lisibilité
+        grad_h = int(h * 0.24)
+        overlay = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+        d = ImageDraw.Draw(overlay)
+        for i in range(grad_h):
+            alpha = int(215 * (i / grad_h) ** 1.4)
+            y = h - grad_h + i
+            d.line([(0, y), (w, y)], fill=(4, 10, 28, alpha))
+        img = Image.alpha_composite(img, overlay)
+
+        draw = ImageDraw.Draw(img)
+        font_main = self._load_font(int(w * 0.062))
+        font_sub = self._load_font(int(w * 0.027))
+
+        part_a, part_b = BRAND_NAME
+        wa = draw.textlength(part_a, font=font_main)
+        wb = draw.textlength(part_b, font=font_main)
+        x = (w - (wa + wb)) / 2
+        y_main = h - int(h * 0.108)
+
+        # Filet doré
+        line_w = int(w * 0.14)
+        y_line = y_main - int(h * 0.016)
+        draw.rectangle(
+            [(w - line_w) / 2, y_line, (w + line_w) / 2, y_line + 5],
+            fill=BRAND_ACCENT + (255,),
+        )
+
+        # Ombre puis texte
+        draw.text((x + 2, y_main + 2), part_a, font=font_main, fill=(0, 0, 0, 170))
+        draw.text((x + wa + 2, y_main + 2), part_b, font=font_main, fill=(0, 0, 0, 170))
+        draw.text((x, y_main), part_a, font=font_main, fill=(255, 255, 255, 255))
+        draw.text((x + wa, y_main), part_b, font=font_main, fill=BRAND_ACCENT + (255,))
+
+        # Identifiant de la page
+        wh = draw.textlength(BRAND_HANDLE, font=font_sub)
+        y_sub = y_main + int(w * 0.062) + int(h * 0.012)
+        draw.text(((w - wh) / 2, y_sub), BRAND_HANDLE, font=font_sub, fill=(220, 225, 235, 230))
+
+        return img.convert("RGB")
 
     def generer_image(self, news_original=None):
         print("Génération de l'image...")
@@ -145,12 +224,19 @@ class TextPost:
 
         # FLUX ignore le negative prompt : les interdits sont mis dans le positif
         positive_prompt = " ".join(positive_prompt.split()[:60])
-        positive_prompt += ", no text, no letters, no people, photorealistic"
+        positive_prompt += (
+            ", no text, no letters, no people, photorealistic, ultra detailed, "
+            "shot on Canon EOS R5, professional color grading, shallow depth of field, "
+            "dramatic lighting, deep blue and gold tones"
+        )
         print("Prompt image :", positive_prompt)
 
         img = self._image_hf(positive_prompt) or self._image_pollinations(positive_prompt)
         if img is None:
             raise RuntimeError("Aucune image générée : publication annulée.")
+
+        img = ImageOps.fit(img, (OUT_W, OUT_H), Image.LANCZOS, centering=(0.5, 0.4))
+        img = self._add_branding(img)
 
         output = OUTPUT_DIR / "img.png"
         img.save(output)
@@ -314,6 +400,9 @@ class Extract_post:
                     )
 
                     clean_text = self.clean_html(raw_text)
+                    # Retire les restes du flux RSS ("The post ... appeared first on ...", "[...]")
+                    clean_text = re.sub(r"\s*The post .*? appeared first on .*$", "", clean_text, flags=re.S)
+                    clean_text = clean_text.replace("[...]", "…").strip()
                     publication_text, publication_datetime = self.get_publication_date(entry)
 
                     if publication_text is None:
