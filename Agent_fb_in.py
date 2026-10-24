@@ -14,7 +14,7 @@ import cloudinary.uploader
 from bs4 import BeautifulSoup
 from PIL import (
     Image, ImageDraw, ImageFont, ImageOps, ImageEnhance,
-    ImageFilter, ImageChops, ImageStat,
+    ImageFilter, ImageChops, ImageStat, features,
 )
 from groq import Groq
 from langchain_groq import ChatGroq
@@ -61,13 +61,17 @@ IG_CAPTION_LIMIT = 2200
 BRAND_NAME = ("Money", ".impact")
 BRAND_HANDLE = "@money.impact.today"
 BRAND_ACCENT = (255, 196, 0)
-BRAND_TAG = os.getenv("BRAND_TAG", "#MONEY_IMPACT")   # étiquette au-dessus du titre
 # Police arabe grasse. Idéal : Cairo-Bold.ttf ou Tajawal-Bold.ttf dans le dossier ./fonts/
 AR_FONT_ENV = os.getenv("AR_FONT_PATH", "")
 
 BASE_DIR = Path(__file__).resolve().parent if "__file__" in globals() else Path.cwd()
 OUTPUT_DIR = BASE_DIR / "output"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+# Logo de la page (PNG transparent conseillé), affiché en haut à gauche
+LOGO_PATH = Path(os.getenv("LOGO_PATH", str(BASE_DIR / "imgs" / "logo.png")))
+# Mettre LOGO_BACKDROP=1 si ton logo est sombre (ajoute un fond foncé derrière)
+LOGO_BACKDROP = os.getenv("LOGO_BACKDROP", "0") == "1"
 
 # Scènes de secours si le LLM échoue (mots-clés -> scène photo précise)
 FALLBACK_SCENES = [
@@ -331,9 +335,20 @@ class TextPost:
     # ------------------------------------------------------------------
     # Titre arabe + branding style "chaîne d'info" (comme Al Arabiya)
     # ------------------------------------------------------------------
+    # L'affichage de l'arabe dépend de la version de Pillow (Raqm ou non). Au premier
+    # appel, le script teste le rendu réel et choisit un mode qui fonctionne :
+    #   "raqm"   : texte brut, Raqm/HarfBuzz fait le shaping + le sens RTL
+    #   "bidi"   : arabic_reshaper + python-bidi, moteur BASIC
+    #   "manual" : arabic_reshaper + inversion des lettres, moteur BASIC
+    # Dans tous les cas, l'ordre des mots est géré ici (un mot = un dessin), donc
+    # il ne peut plus être inversé par le moteur de texte.
+    _ar_mode = None
+    _AR_RE = re.compile(r"[\u0600-\u06FF\u0750-\u077F\uFB50-\uFDFF\uFE70-\uFEFF]")
+    _NUM_RE = re.compile(r"([0-9\u0660-\u0669][0-9\u0660-\u0669.,%]*)")
+
     @staticmethod
-    def _load_arabic_font(size):
-        candidates = [
+    def _ar_font_candidates():
+        return [
             AR_FONT_ENV,
             str(BASE_DIR / "fonts" / "Cairo-Bold.ttf"),
             str(BASE_DIR / "fonts" / "Tajawal-Bold.ttf"),
@@ -343,10 +358,14 @@ class TextPost:
             "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
             "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf",
         ]
-        # Layout BASIC : le texte est déjà reformé/réordonné par arabic_reshaper + bidi.
-        # Avec RAQM, Pillow le re-traiterait et casserait les lettres.
-        layout = getattr(getattr(ImageFont, "Layout", None), "BASIC", None)
-        for chemin in candidates:
+
+    @classmethod
+    def _open_ar_font(cls, size, mode):
+        layout_cls = getattr(ImageFont, "Layout", None)
+        layout = None
+        if layout_cls is not None:
+            layout = layout_cls.RAQM if mode == "raqm" else layout_cls.BASIC
+        for chemin in cls._ar_font_candidates():
             if chemin and os.path.exists(chemin):
                 try:
                     if layout is not None:
@@ -354,20 +373,124 @@ class TextPost:
                     return ImageFont.truetype(chemin, size)
                 except Exception:
                     continue
-        return TextPost._load_font(size)
+        raise RuntimeError("Aucune police arabe trouvée")
 
-    @staticmethod
-    def _shape(text):
-        """Lettres arabes jointes + ordre droite-à-gauche correct (mots latins inclus)."""
+    @classmethod
+    def _load_arabic_font(cls, size):
+        mode = cls._detect_ar_mode()
+        try:
+            return cls._open_ar_font(size, mode)
+        except Exception:
+            print("ATTENTION : aucune police arabe trouvée (mets Cairo-Bold.ttf dans ./fonts/)")
+            return TextPost._load_font(size)
+
+    @classmethod
+    def _ar_word_visual(cls, word, mode):
+        """Un mot arabe -> chaîne à dessiner (gauche vers droite)."""
+        if mode == "raqm" or not ARABIC_OK:
+            return word
+        shaped = arabic_reshaper.reshape(word)
+        if mode == "bidi":
+            return get_display(shaped, base_dir="R")
+        # "manual" : lettres inversées, les chiffres gardent leur ordre
+        parts = cls._NUM_RE.split(shaped)
+        pieces = [p if i % 2 else p[::-1] for i, p in enumerate(parts)]
+        return "".join(reversed(pieces))
+
+    @classmethod
+    def _ar_selftest(cls, mode):
+        """Dessine 'اب' : l'alef (grande barre) doit être à DROITE du bêh."""
+        font = cls._open_ar_font(100, mode)
+        kw = {"direction": "rtl", "language": "ar"} if mode == "raqm" else {}
+        img = Image.new("L", (400, 260), 0)
+        ImageDraw.Draw(img).text(
+            (60, 40), cls._ar_word_visual("اب", mode), font=font, fill=255, **kw
+        )
+        bbox = img.getbbox()
+        if not bbox:
+            return False
+        x0, y0, x1, y1 = bbox
+        strip = max(4, (x1 - x0) // 5)
+        left = img.crop((x0, y0, x0 + strip, y1)).getbbox()
+        right = img.crop((x1 - strip, y0, x1, y1)).getbbox()
+        if not left or not right:
+            return False
+        return right[1] < left[1] - 5
+
+    @classmethod
+    def _detect_ar_mode(cls):
+        if cls._ar_mode:
+            return cls._ar_mode
+        candidates = []
+        try:
+            if features.check("raqm") and features.check("fribidi") and features.check("harfbuzz"):
+                candidates.append("raqm")
+        except Exception:
+            pass
         if ARABIC_OK:
-            return get_display(arabic_reshaper.reshape(text), base_dir="R")
-        return text
+            candidates += ["bidi", "manual"]
+
+        chosen = None
+        for mode in candidates:
+            try:
+                if cls._ar_selftest(mode):
+                    chosen = mode
+                    break
+                print(f"Mode arabe '{mode}' : rendu incorrect, essai suivant.")
+            except Exception as e:
+                print(f"Mode arabe '{mode}' indisponible : {e}")
+        if chosen is None:
+            chosen = "bidi" if ARABIC_OK else "plain"
+            print("ATTENTION : aucun mode arabe validé, l'affichage peut être incorrect.")
+        cls._ar_mode = chosen
+        print(f"Mode d'écriture arabe retenu : {chosen}")
+        return chosen
+
+    @classmethod
+    def _ar_runs(cls, text):
+        """Découpe en blocs : mots arabes seuls, mots latins/nombres regroupés (ordre LTR)."""
+        runs = []
+        for tok in text.split():
+            is_ar = bool(cls._AR_RE.search(tok))
+            if runs and not is_ar and not runs[-1][1]:
+                runs[-1] = (runs[-1][0] + " " + tok, False)
+            else:
+                runs.append((tok, is_ar))
+        return runs
+
+    @classmethod
+    def _run_args(cls, run, is_ar):
+        mode = cls._detect_ar_mode()
+        if is_ar:
+            kw = {"direction": "rtl", "language": "ar"} if mode == "raqm" else {}
+            return cls._ar_word_visual(run, mode), kw
+        return run, ({"direction": "ltr"} if mode == "raqm" else {})
+
+    def _line_width(self, draw, text, font):
+        runs = self._ar_runs(text)
+        space = draw.textlength(" ", font=font)
+        total = 0
+        for run, is_ar in runs:
+            s, kw = self._run_args(run, is_ar)
+            total += draw.textlength(s, font=font, **kw)
+        return total + space * max(0, len(runs) - 1)
+
+    def _draw_rtl_line(self, draw, right_x, y, text, font, fill):
+        """Dessine une ligne arabe alignée à droite : 1er mot à droite, suivants vers la gauche."""
+        space = draw.textlength(" ", font=font)
+        x = right_x
+        for run, is_ar in self._ar_runs(text):
+            s, kw = self._run_args(run, is_ar)
+            rw = draw.textlength(s, font=font, **kw)
+            x -= rw
+            draw.text((x, y), s, font=font, fill=fill, **kw)
+            x -= space
 
     def _wrap(self, draw, text, font, max_w):
         lines, cur = [], []
         for word in text.split():
             test = " ".join(cur + [word])
-            if cur and draw.textlength(self._shape(test), font=font) > max_w:
+            if cur and self._line_width(draw, test, font) > max_w:
                 lines.append(" ".join(cur))
                 cur = [word]
             else:
@@ -392,11 +515,27 @@ class TextPost:
             lines[-1] = lines[-1].rstrip(" ،,.") + "…"
         return font, lines, line_h
 
+    @staticmethod
+    def _load_logo(w, h):
+        """Charge imgs/logo.png (PNG transparent conseillé). None si absent."""
+        try:
+            if not LOGO_PATH.is_file():
+                print(f"Logo introuvable ({LOGO_PATH}) : logo texte utilisé à la place.")
+                return None
+            logo = Image.open(LOGO_PATH).convert("RGBA")
+            ratio = min(int(w * 0.24) / logo.width, int(h * 0.11) / logo.height)
+            size = (max(1, int(logo.width * ratio)), max(1, int(logo.height * ratio)))
+            return logo.resize(size, Image.LANCZOS)
+        except Exception as e:
+            print(f"Logo illisible : {e}")
+            return None
+
     def _add_branding(self, img, headline=None):
         img = img.convert("RGBA")
         w, h = img.size
         margin = int(w * 0.07)
         has_title = bool(headline and headline.strip())
+        logo = self._load_logo(w, h)
 
         # ---- 1) Dégradés (bas fort pour le titre, haut léger pour le logo) ----
         grad = Image.new("RGBA", (w, h), (0, 0, 0, 0))
@@ -405,29 +544,30 @@ class TextPost:
         for i in range(bottom_h):
             a = int(235 * (i / bottom_h) ** 1.5)
             gd.line([(0, h - bottom_h + i), (w, h - bottom_h + i)], fill=(4, 10, 28, a))
-        top_h = int(h * 0.14)
+        top_h = int(h * 0.16)
         for i in range(top_h):
-            a = int(150 * (1 - i / top_h) ** 1.6)
+            a = int(160 * (1 - i / top_h) ** 1.6)
             gd.line([(0, i), (w, i)], fill=(4, 10, 28, a))
         img = Image.alpha_composite(img, grad)
         probe = ImageDraw.Draw(img)
 
-        # ---- 2) Géométrie des éléments ----
-        # Logo en haut à gauche
-        f_logo = self._load_font(int(w * 0.046))
-        part_a, part_b = BRAND_NAME
-        wa = probe.textlength(part_a, font=f_logo)
-        wb = probe.textlength(part_b, font=f_logo)
-        logo_bb = f_logo.getbbox(part_a + part_b)
-        pad_x, pad_y = int(w * 0.022), int(w * 0.013)
+        # ---- 2) Géométrie ----
         lx, ly = int(w * 0.04), int(h * 0.03)
-        logo_box = [lx, ly, lx + wa + wb + 2 * pad_x, ly + logo_bb[3] + 2 * pad_y]
+        part_a, part_b = BRAND_NAME
 
-        # Handle en bas à gauche
+        if logo is not None:
+            logo_box = [lx, ly, lx + logo.width, ly + logo.height]
+        else:  # secours : logo en texte
+            f_logo = self._load_font(int(w * 0.046))
+            wa = probe.textlength(part_a, font=f_logo)
+            wb = probe.textlength(part_b, font=f_logo)
+            logo_bb = f_logo.getbbox(part_a + part_b)
+            pad_x, pad_y = int(w * 0.022), int(w * 0.013)
+            logo_box = [lx, ly, lx + wa + wb + 2 * pad_x, ly + logo_bb[3] + 2 * pad_y]
+
         f_sub = self._load_font(int(w * 0.027))
         handle_y = h - int(h * 0.055)
 
-        # Titre + étiquette
         title_data = None
         if has_title:
             bottom = handle_y - int(h * 0.028)
@@ -436,62 +576,71 @@ class TextPost:
             )
             top = bottom - len(lines) * line_h
 
-            f_tag = self._load_font(int(w * 0.036))
-            tb = f_tag.getbbox(BRAND_TAG)
+            # Étiquette = nom de la page (Money.impact)
+            f_tag = self._load_font(int(w * 0.038))
+            ta = probe.textlength(part_a, font=f_tag)
+            tb_w = probe.textlength(part_b, font=f_tag)
+            tbb = f_tag.getbbox(part_a + part_b)
             tp_x, tp_y = int(w * 0.022), int(w * 0.011)
             bar_w = max(8, int(w * 0.009))
-            box_w = (tb[2] - tb[0]) + 2 * tp_x + bar_w
-            box_h = tb[3] + 2 * tp_y
+            box_w = int(ta + tb_w) + 2 * tp_x + bar_w
+            box_h = tbb[3] + 2 * tp_y
             tag_right = w - margin
-            tag_box = [tag_right - box_w, top - int(h * 0.022) - box_h,
-                       tag_right, top - int(h * 0.022)]
-            title_data = (font, lines, line_h, top, f_tag, tag_box, tp_x, tp_y, bar_w)
+            gap = int(h * 0.022)
+            tag_box = [tag_right - box_w, top - gap - box_h, tag_right, top - gap]
+            title_data = (font, lines, line_h, top, f_tag, ta, tag_box, tp_x, tp_y, bar_w)
 
-        # ---- 3) Couche douce (ombres floutées) ----
+        # ---- 3) Ombres floutées ----
         soft = Image.new("RGBA", (w, h), (0, 0, 0, 0))
         sd = ImageDraw.Draw(soft)
+        if logo is not None:
+            shadow = Image.new("RGBA", logo.size, (0, 0, 0, 0))
+            shadow.putalpha(logo.getchannel("A").point(lambda a: int(a * 0.75)))
+            soft.alpha_composite(shadow, (lx + 3, ly + 4))
         if title_data:
             font, lines, line_h, top = title_data[:4]
             for i, line in enumerate(lines):
-                shaped = self._shape(line)
-                lw = probe.textlength(shaped, font=font)
-                sd.text((w - margin - lw, top + i * line_h + 4), shaped,
-                        font=font, fill=(0, 0, 0, 220))
+                self._draw_rtl_line(sd, w - margin, top + i * line_h + 4, line, font,
+                                    (0, 0, 0, 220))
         soft = soft.filter(ImageFilter.GaussianBlur(5))
         img = Image.alpha_composite(img, soft)
 
-        # ---- 4) Couche translucide nette (fond du logo) ----
+        # ---- 4) Fond translucide net (logo texte ou fond du logo image) ----
         crisp = Image.new("RGBA", (w, h), (0, 0, 0, 0))
         cd = ImageDraw.Draw(crisp)
-        cd.rectangle(logo_box, fill=(4, 10, 28, 190), outline=(255, 255, 255, 220), width=2)
+        if logo is None:
+            cd.rectangle(logo_box, fill=(4, 10, 28, 190), outline=(255, 255, 255, 220), width=2)
+        elif LOGO_BACKDROP:
+            p = int(w * 0.012)
+            cd.rectangle([logo_box[0] - p, logo_box[1] - p, logo_box[2] + p, logo_box[3] + p],
+                         fill=(4, 10, 28, 190), outline=(255, 255, 255, 220), width=2)
         img = Image.alpha_composite(img, crisp)
 
         # ---- 5) Éléments opaques ----
+        if logo is not None:
+            img.alpha_composite(logo, (lx, ly))
         draw = ImageDraw.Draw(img)
 
-        # Logo
-        draw.text((lx + pad_x, ly + pad_y), part_a, font=f_logo, fill=(255, 255, 255, 255))
-        draw.text((lx + pad_x + wa, ly + pad_y), part_b, font=f_logo,
-                  fill=BRAND_ACCENT + (255,))
-        draw.rectangle([logo_box[0], logo_box[3] - 5, logo_box[2], logo_box[3]],
-                       fill=BRAND_ACCENT + (255,))
+        if logo is None:
+            draw.text((lx + pad_x, ly + pad_y), part_a, font=f_logo, fill=(255, 255, 255, 255))
+            draw.text((lx + pad_x + wa, ly + pad_y), part_b, font=f_logo,
+                      fill=BRAND_ACCENT + (255,))
+            draw.rectangle([logo_box[0], logo_box[3] - 5, logo_box[2], logo_box[3]],
+                           fill=BRAND_ACCENT + (255,))
 
         if title_data:
-            font, lines, line_h, top, f_tag, tag_box, tp_x, tp_y, bar_w = title_data
-            # Étiquette blanche + barre dorée à droite
+            font, lines, line_h, top, f_tag, ta, tag_box, tp_x, tp_y, bar_w = title_data
             draw.rectangle(tag_box, fill=(255, 255, 255, 255))
             draw.rectangle([tag_box[2] - bar_w, tag_box[1], tag_box[2], tag_box[3]],
                            fill=BRAND_ACCENT + (255,))
-            draw.text((tag_box[0] + tp_x, tag_box[1] + tp_y), BRAND_TAG,
-                      font=f_tag, fill=(5, 12, 30, 255))
-            # Titre aligné à droite
+            draw.text((tag_box[0] + tp_x, tag_box[1] + tp_y), part_a, font=f_tag,
+                      fill=(5, 12, 30, 255))
+            draw.text((tag_box[0] + tp_x + ta, tag_box[1] + tp_y), part_b, font=f_tag,
+                      fill=(214, 148, 0, 255))
             for i, line in enumerate(lines):
-                shaped = self._shape(line)
-                lw = draw.textlength(shaped, font=font)
-                draw.text((w - margin - lw, top + i * line_h), shaped,
-                          font=font, fill=(255, 255, 255, 255))
+                self._draw_rtl_line(draw, w - margin, top + i * line_h, line, font,
+                                    (255, 255, 255, 255))
 
-        # Handle
         draw.text((int(w * 0.04), handle_y), BRAND_HANDLE, font=f_sub,
                   fill=(225, 230, 240, 235))
 
