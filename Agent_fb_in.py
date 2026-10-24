@@ -1,6 +1,6 @@
 import sys
 import faulthandler
-SCRIPT_VERSION = "2026-10-24-cloudflare-logo"
+SCRIPT_VERSION = "2026-10-24-groq-fix"
 print(f"▶ Python démarré (version {SCRIPT_VERSION}), chargement des modules…", flush=True)
 faulthandler.enable()
 # Si le script reste figé, affiche la pile d'appel toutes les 90 s (montre OÙ il bloque)
@@ -50,6 +50,7 @@ TRUSTED_WEB_SOURCES = {
 }
 
 # Modifiables par variables d'environnement (sans toucher au code)
+# Conseil : GROQ_MODEL=llama-3.3-70b-versatile (limites plus confortables que qwen)
 GROQ_MODEL = os.getenv("GROQ_MODEL", "qwen/qwen3.8-27b")
 # Générateurs d'image, essayés dans cet ordre : Cloudflare -> Hugging Face -> Pollinations
 CF_IMAGE_MODEL = os.getenv("CF_IMAGE_MODEL", "@cf/black-forest-labs/flux-1-schnell")
@@ -68,6 +69,12 @@ MAX_POSTS_PER_RUN = int(os.getenv("MAX_POSTS_PER_RUN", "100"))
 MAX_ATTEMPTS_PER_RUN = int(os.getenv("MAX_ATTEMPTS_PER_RUN", "110"))
 MAX_NEWS_AGE_HOURS = int(os.getenv("MAX_NEWS_AGE_HOURS", "500"))
 IG_CAPTION_LIMIT = 2200
+
+# Limites de tokens Groq (évite le 429 « Request too large » sur les petits quotas OTPM)
+TRANSLATION_MAX_TOKENS_MAIN = int(os.getenv("TRANSLATION_MAX_TOKENS_MAIN", "900"))
+TRANSLATION_MAX_TOKENS_FALLBACK = int(os.getenv("TRANSLATION_MAX_TOKENS_FALLBACK", "1500"))
+IMAGE_PROMPT_MAX_TOKENS = int(os.getenv("IMAGE_PROMPT_MAX_TOKENS", "400"))
+TRANSLATION_INPUT_MAX_CHARS = int(os.getenv("TRANSLATION_INPUT_MAX_CHARS", "1500"))
 
 # Identité de la page
 BRAND_NAME = ("Money", ".impact")
@@ -227,6 +234,7 @@ class TextPost:
             groq_api_key=os.getenv("TOKEN_AI_DESCRYB_IMG", ""),
             timeout=60,
             max_retries=1,
+            max_tokens=IMAGE_PROMPT_MAX_TOKENS,
         )
 
     # ------------------------------------------------------------------
@@ -1041,6 +1049,10 @@ class TextPost:
 # ======================================================================
 # EXTRACTION DES NEWS + TRADUCTION
 # ======================================================================
+GROQ_FALLBACKS = ("llama-3.3-70b-versatile", "openai/gpt-oss-120b", "qwen/qwen3-32b",
+                  "llama-3.1-8b-instant")
+
+
 class Extract_post:
     def __init__(self):
         self.model_groq_name = GROQ_MODEL
@@ -1155,6 +1167,7 @@ class Extract_post:
         prompt = """
         You are a professional Arabic translator specializing in financial news.
         Translate into natural Modern Standard Arabic. Preserve financial meaning and facts.
+        Keep the translation under 900 Arabic characters (summarize lightly if the source is long).
         Return ONLY a valid JSON object with two fields:
         {"caption": "full translation of the text",
          "headline": "short punchy Arabic news headline"}
@@ -1162,44 +1175,51 @@ class Extract_post:
         market impact if any), no emojis, no hashtags, no quotation marks, no source name.
         """
         t = time.time()
-        log(f"Traduction en arabe (Groq, modèle {self.model_groq_name})…")
+        text = (text or "")[:TRANSLATION_INPUT_MAX_CHARS]   # limite l'entrée -> sortie plus courte
         messages = [
             {"role": "system", "content": prompt},
             {"role": "user", "content": f"SOURCE TEXT TO TRANSLATE:\n{text}"},
         ]
+        models = [self.model_groq_name] + [m for m in GROQ_FALLBACKS if m != self.model_groq_name]
         last_error = None
-        for mode_json in (True, False):   # 1) mode JSON strict, 2) texte libre puis extraction
-            try:
-                kwargs = {"response_format": {"type": "json_object"}} if mode_json else {}
-                response = self.client.chat.completions.create(
-                    model=self.model_groq_name,
-                    messages=messages,
-                    temperature=0.0,
-                    **kwargs,
-                )
-                data = self._extract_json(response.choices[0].message.content)
-                if isinstance(data, dict) and str(data.get("caption") or "").strip():
-                    log(f"Traduction reçue en {time.time() - t:.1f}s", level="OK")
-                    return data
-                last_error = f"réponse sans 'caption' : {str(data)[:150]}"
-                log(f"Traduction inexploitable ({last_error})", level="WARN")
-            except Exception as e:
-                last_error = f"{type(e).__name__} : {str(e)[:300]}"
-                log(f"Traduction essai {'JSON' if mode_json else 'texte'} échoué ({last_error})",
-                    level="WARN")
-        log(f"Traduction ÉCHOUÉE : {last_error}", level="ERROR")
-        if last_error and "model" in last_error.lower() and (
-                "not" in last_error.lower() or "exist" in last_error.lower()):
-            log("   -> le modèle Groq n'existe pas / n'est plus disponible : "
-                "change la variable GROQ_MODEL.", level="WARN")
+
+        for model in models:
+            max_tokens = (TRANSLATION_MAX_TOKENS_MAIN if model == self.model_groq_name
+                          else TRANSLATION_MAX_TOKENS_FALLBACK)
+            for mode_json in (True, False):
+                try:
+                    log(f"Traduction en arabe (Groq, modèle {model}, "
+                        f"{'JSON' if mode_json else 'texte'})…")
+                    kwargs = {"response_format": {"type": "json_object"}} if mode_json else {}
+                    response = self.client.chat.completions.create(
+                        model=model,
+                        messages=messages,
+                        temperature=0.0,
+                        max_tokens=max_tokens,
+                        **kwargs,
+                    )
+                    data = self._extract_json(response.choices[0].message.content)
+                    if isinstance(data, dict) and str(data.get("caption") or "").strip():
+                        log(f"Traduction reçue en {time.time() - t:.1f}s ({model})", level="OK")
+                        return data
+                    last_error = f"réponse sans 'caption' : {str(data)[:150]}"
+                    log(f"Traduction inexploitable ({last_error})", level="WARN")
+                except Exception as e:
+                    last_error = f"{type(e).__name__} : {str(e)[:300]}"
+                    log(f"Traduction {model} ({'JSON' if mode_json else 'texte'}) échouée : "
+                        f"{last_error}", level="WARN")
+                    low = last_error.lower()
+                    # Limite de débit / modèle inexistant : inutile de réessayer ce modèle
+                    if ("429" in last_error or "ratelimit" in low or "model_not_found" in low
+                            or "does not exist" in low or "decommissioned" in low):
+                        break
+        log(f"Traduction ÉCHOUÉE sur tous les modèles : {last_error}", level="ERROR")
         return None
 
 
 # ======================================================================
 # MAIN
 # ======================================================================
-GROQ_FALLBACKS = ("llama-3.3-70b-versatile", "openai/gpt-oss-120b", "qwen/qwen3-32b",
-                  "llama-3.1-8b-instant")
 TOTAL_STEPS = 6
 
 
