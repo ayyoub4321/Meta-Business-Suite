@@ -59,7 +59,7 @@ class TextPost:
             groq_api_key=os.getenv("TOKEN_AI_DESCRYB_IMG", "")
         )
         
-        model_id = "stabilityai/sdxl-turbo"
+        model_id = "stabilityai/stable-diffusion-xl-base-1.0"
 
         if torch.cuda.is_available():
             device, dtype, variant = "cuda", torch.float16, "fp16"
