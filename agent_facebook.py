@@ -75,9 +75,10 @@ class TextPost:
 
     def __init__(self):
         model_groq_name="qwen/qwen3.8-27b"
+        # رفعنا الـ temperature باش الـ LLM يكون مبدع وتتنوع الأفكار وما يبقاش مبلواني
         self.llm = ChatGroq(
             model_name=model_groq_name,
-            temperature=0.1,
+            temperature=0.8,
             groq_api_key=os.getenv("TOKEN_AI_DESCRYB_IMG", globals().get("TOKEN_AI_DESCRYB_IMG", "")) 
         )
         
@@ -98,62 +99,74 @@ class TextPost:
             variant=variant
         ).to(device)
 
-    
-    def donne_moi_prompt_images(self,news):
-        prompt="""
+    def donne_moi_prompt_images(self, news):
+        system_prompt = """
+        You are an elite, world-class Hollywood 3D Art Director and Master Visual Prompt Engineer for premium financial journalism. 
+        Your absolute superpower is transforming dry financial news articles into hyper-realistic, striking, dynamic 3D visual metaphors that tell a compelling story at a glance.
+        """
+        
+        user_prompt = f"""
+        Analyze the following financial news article with extreme care. Extract the unique economic event, trend, or decision (e.g., interest rate pause, inflation spikes, central bank policy shifts, market crashes, or currency surges). 
+        Then, create a completely unique, highly relevant, and breathtaking 3D visual scene that represents THIS specific news and nothing else. Never use repetitive generic clichés (like old anchors or basic shields). Make it dynamic, original, and deeply connected to the text.
 
-                You are an expert AI Visual Prompt Engineer specializing in 3D fintech graphics and financial journalism.
+        NEWS ARTICLE:
+        {news}
 
-                YOUR TASK:
-                Analyze the provided financial news and translate its core concepts into an ultra-detailed 3D visual prompt in English for SDXL Turbo.
+        STRICT GENERATION RULES:
+        1. UNIQUE VISUAL METAPHOR: Invent custom, engaging 3D elements (e.g., floating kinetic energy pendulums, futuristic digital data crystals, glowing macroeconomic balancing mechanisms, or abstract financial wave architectures) matching the exact sentiment of the news.
+        2. CINEMATIC AESTHETIC & QUALITY:
+        - Style: Unreal Engine 5 hyper-realistic 3D render, Octane render, crystal-clear macro and isometric details.
+        - Background: Deep moody cinematic background (dark navy, obsidian slate #05070B) with subtle ambient floating particles.
+        - Lighting: Dramatic volumetric neon rim lighting (electric blue, emerald green, or fiery amber matching the specific news vibe), high-contrast ray-traced studio reflections.
+        3. ABSOLUTE CONSTRAINTS:
+        - NO text, letters, numbers, symbols, words, watermarks, signatures, human faces, or anatomy anywhere.
 
-                STRICT VISUAL MAPPING RULES:
-                1. ACCURATE METAPHORS ONLY:
-                - Central Bank / Rate Hold / Hawkish stance -> Glowing geometric glass shield, solid vault, or metallic balance scale.
-                - Currency Surge / Strong Exports -> Polished metallic coins rising on reflective grid, soaring emerald trendlines.
-                - Fiscal Deficit / Debt Policy -> Heavy titanium foundation or fiscal anchor.
-                - Inflation / Price Increases -> Burning amber light, expanding digital spheres.
-                2. COMPOSITION & AESTHETIC:
-                - Limit to 2 or 3 clear focal elements for SDXL Turbo.
-                - Background: Dark mode slate/navy (#05070B), dark frosted glass grid.
-                - Lighting: High-contrast volumetric neon rim lighting, ray-traced reflections.
-                - Style: Sleek 3D fintech UI visual, 35mm isometric or low-angle macro view.
-                3. ABSOLUTE CONSTRAINTS:
-                - NO text, letters, numbers, symbols, characters, or human faces.
+        OUTPUT FORMAT (STRICT):
+        Output ONLY the two blocks below without introduction or conclusion:
 
-                OUTPUT FORMAT (STRICT):
-                Output ONLY the two blocks below without introduction or conclusion:
+        POSITIVE PROMPT:
+        [A hyper-detailed, cinematic 3D paragraph in English describing precise lighting, premium materials like brushed titanium and glowing frosted glass, dramatic composition, and dynamic motion tailored explicitly to this news]
 
-                POSITIVE PROMPT:
-                [A dense, highly descriptive 3D scene paragraph in English focusing on lighting, materials, colors, dynamic motion, and composition]
+        NEGATIVE PROMPT:
+        text, letters, words, numbers, watermark, signature, human, face, blurry, low resolution, noise, distortion, 2d illustration, flat, cartoon, boring, generic anchor
+        """
 
-                NEGATIVE PROMPT:
-                anchor, text, letters, words, numbers, watermark, signature, human, face, blurry, low resolution, noise, distortion, 2d illustration  
+        try:
+            response = self.llm.invoke([
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ])
+            return response
+        except Exception as e:
+            print(f"Erreur LLM prompt generation: {e}")
+            class Fallback:
+                content = "POSITIVE PROMPT:\nFuturistic 3D abstract financial data architecture, glowing neon lights, cinematic 8k render\nNEGATIVE PROMPT:\ntext, letters, words, numbers, watermark"
+            return Fallback()
 
+    def generer_image(self, news_original=None):
+        print(" Génération de l'image dynamique mkatba 3la lkhabar...")
+        obj_describe = self.donne_moi_prompt_images(news_original)
+        text_describe = obj_describe.content
+        
+        try:
+            positive_prompt = text_describe.split("NEGATIVE PROMPT:")[1].strip()
+            negative_prompt = text_describe.split("NEGATIVE PROMPT:")[0].split("POSITIVE PROMPT:")[1].strip()
+        except Exception:
+            positive_prompt = "Futuristic 3D abstract financial data architecture, glowing neon lights, hyper-detailed render"
+            negative_prompt = "text, letters, words, numbers, watermark, signature, human, face, blurry"
 
-          """
-        prompt = prompt.strip()
-        return self.llm.invoke(prompt+news)
-
-
-    def generer_image(self,news_original=None):
-        print(" Génération de l'image à partir du texte...")
-        obj_describe=self.donne_moi_prompt_images(news_original)
-        text_describe=obj_describe.content
-        positive_prompt = text_describe.split("NEGATIVE PROMPT:")[1]
-        negative_prompt = text_describe.split("NEGATIVE PROMPT:")[0].split("POSITIVE PROMPT:")[1]
         image = self.pipeline(
             prompt=positive_prompt,
             negative_prompt=negative_prompt,
-            num_inference_steps=2,
-            guidance_scale=0.0
+            num_inference_steps=4,  # الجودة و الدقة
+            guidance_scale=1.2      # باش الموديل يلتزم بدقة بالبرومبت وما يخرجش عليه
         ).images[0]
 
-        # 5. Sauvegarde
-        output=OUTPUT_DIR / "img.png"
+        output = OUTPUT_DIR / "img.png"
         image.save(output)
-        print(f"Terminé ! L'image est sauvegardée sous {output}")
+        print(f"Terminé ! L'image dynamique est sauvegardée sous {output}")
         return output
+        
 
     
     def publier_texte_partout(self, news_original,news_translited):
