@@ -4,10 +4,14 @@ name: Finance News Agent
 on:
   workflow_dispatch:
   schedule:
-    - cron:  "0 * * * *"
+    - cron: "0 * * * *"
 
 permissions:
-  contents: read
+  contents: write
+
+concurrency:
+  group: finance-news-agent
+  cancel-in-progress: false
 
 jobs:
   run-agent:
@@ -17,6 +21,8 @@ jobs:
     steps:
       - name: Recuperer le code
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Installer Python
         uses: actions/setup-python@v5
@@ -38,3 +44,24 @@ jobs:
           CLOUDINARY_API_KEY: ${{ secrets.CLOUDINARY_API_KEY }}
           CLOUDINARY_API_SECRET: ${{ secrets.CLOUDINARY_API_SECRET }}
         run: python -u agent_facebook.py
+
+      - name: Sauvegarder l'historique dans GitHub
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ ! -f historique_posts.json ]; then
+            echo "{}" > historique_posts.json
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add historique_posts.json
+
+          if ! git diff --cached --quiet; then
+            git commit -m "Update publication history"
+            git push origin "HEAD:${GITHUB_REF_NAME}"
+          else
+            echo "Aucun changement dans l'historique."
+          fi
