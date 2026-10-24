@@ -603,65 +603,67 @@ import os
 import json
 import time
 
+
 def main():
     fichier_json = "historique_posts.json"
     extract_post = Extract_post()
     text_post = TextPost()
-    
-    while True:
-        historique = {}
-        if os.path.exists(fichier_json):
-            with open(fichier_json, "r", encoding="utf-8") as f:
-                try:
-                    historique = json.load(f)
-                except json.JSONDecodeError:
-                    historique = {}
-                    
-        fetch_all_news = extract_post.fetch_all_news()
-        changement_detecte = False
-        
-        for source, news in fetch_all_news.items():
-            # 1. CORRECTION : On extrait d'abord les variables du dictionnaire 'news'
-            vrai_source = source.split("_")[0]
-            title = news["title"]
-            content = news["continue"]
-            date = news["date"]
-            
-            # 2. CORRECTION : Maintenant on peut créer le post_id sans erreur
-            post_id = f"{vrai_source}_{title}_{date}"
-            
-            # 3. LE TEST : On vérifie si l'identifiant existe déjà
-            if post_id in historique:
-                continue
-            
-            # 4. Action si le post est nouveau
-            text_original = f"{title}\n {content} \n\n source: {vrai_source} , data: {date}"
-            text_transleted = extract_post.tradication_of_text(text_original)
+
+    historique = {}
+
+    if os.path.exists(fichier_json):
+        with open(fichier_json, "r", encoding="utf-8") as f:
             try:
-                text_transleted_net=""
-                for key,value in text_transleted.items():
-from pathlib import Path
-                    text_transleted_net+=f" {value}"
-            except:
-                text_transleted_net=text_transleted
-            # print("text original \n ",text_original)
-            # print("text transleted \n ",text_transleted)
-            # print("text transleted clean \n ",text_transleted_net)
-            text_post.publier_texte_partout(text_original, text_transleted_net)
-            # 5. Enregistrement en mémoire
-            historique[post_id] = {
-                "source": vrai_source,
-                "titre": title,
-                "date": date
-            }
-            changement_detecte = True
-            
-        
-        # 6. OPTIMISATION : On sauvegarde le fichier JSON une seule fois après la fin de la boucle for
-        if changement_detecte:
-            with open(fichier_json, "w", encoding="utf-8") as f:
-                json.dump(historique, f, ensure_ascii=False, indent=4)
-                
-        time.sleep(600)
+                historique = json.load(f)
+            except json.JSONDecodeError:
+                historique = {}
+
+    fetch_all_news = extract_post.fetch_all_news()
+    changement_detecte = False
+
+    for source, news in fetch_all_news.items():
+        vrai_source = source.split("_")[0]
+        title = news["title"]
+        content = news["continue"]
+        date = news["date"]
+
+        post_id = f"{vrai_source}_{title}_{date}"
+
+        if post_id in historique:
+            print(f"Déjà traité : {title}")
+            continue
+
+        text_original = (
+            f"{title}\n{content}\n\n"
+            f"source: {vrai_source}, date: {date}"
+        )
+
+        text_transleted = extract_post.tradication_of_text(text_original)
+
+        if isinstance(text_transleted, dict):
+            text_transleted_net = " ".join(
+                str(value) for value in text_transleted.values()
+            )
+        else:
+            text_transleted_net = str(text_transleted)
+
+        text_post.publier_texte_partout(
+            text_original, text_transleted_net
+        )
+
+        historique[post_id] = {
+            "source": vrai_source,
+            "titre": title,
+            "date": date
+        }
+        changement_detecte = True
+
+    if changement_detecte:
+        with open(fichier_json, "w", encoding="utf-8") as f:
+            json.dump(historique, f, ensure_ascii=False, indent=4)
+
+    print("Fin de cette exécution.")
+
+
 if __name__ == "__main__":
     main()
