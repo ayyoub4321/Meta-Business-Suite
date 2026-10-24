@@ -1,3 +1,8 @@
+import sys, faulthandler
+print("▶ Python démarré, chargement des modules…", flush=True)
+faulthandler.enable()
+# Si le script reste figé, affiche la pile d'appel toutes les 90 s (montre OÙ il bloque)
+faulthandler.dump_traceback_later(90, repeat=True, file=sys.stderr)
 import os
 import io
 import json
@@ -19,7 +24,7 @@ from PIL import (
 from groq import Groq
 from langchain_groq import ChatGroq
 from huggingface_hub import InferenceClient
-
+print("▶ Modules chargés.", flush=True)
 try:
     import arabic_reshaper
     from bidi.algorithm import get_display
@@ -27,7 +32,7 @@ try:
 except ImportError:
     ARABIC_OK = False
     print("ATTENTION : pip install arabic-reshaper python-bidi (sinon l'arabe sera mal affiché)")
-
+print("▶ Modules arabic_reshaper  chargés.", flush=True)
 # ======================================================================
 # CONFIGURATION
 # ======================================================================
