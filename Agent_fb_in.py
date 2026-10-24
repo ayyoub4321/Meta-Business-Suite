@@ -20,6 +20,14 @@ from groq import Groq
 from langchain_groq import ChatGroq
 from huggingface_hub import InferenceClient
 
+try:
+    import arabic_reshaper
+    from bidi.algorithm import get_display
+    ARABIC_OK = True
+except ImportError:
+    ARABIC_OK = False
+    print("ATTENTION : pip install arabic-reshaper python-bidi (sinon l'arabe sera mal affiché)")
+
 # ======================================================================
 # CONFIGURATION
 # ======================================================================
@@ -44,15 +52,18 @@ OUT_W, OUT_H = 1080, 1350      # sortie finale 4:5 (Facebook / Instagram)
 IMAGE_CANDIDATES = int(os.getenv("IMAGE_CANDIDATES", "2"))
 
 # Contrôle de publication
-MAX_POSTS_PER_RUN = int(os.getenv("MAX_POSTS_PER_RUN", "15"))
-MAX_ATTEMPTS_PER_RUN = int(os.getenv("MAX_ATTEMPTS_PER_RUN", "15"))
-MAX_NEWS_AGE_HOURS = int(os.getenv("MAX_NEWS_AGE_HOURS", "200"))
+MAX_POSTS_PER_RUN = int(os.getenv("MAX_POSTS_PER_RUN", "1"))
+MAX_ATTEMPTS_PER_RUN = int(os.getenv("MAX_ATTEMPTS_PER_RUN", "3"))
+MAX_NEWS_AGE_HOURS = int(os.getenv("MAX_NEWS_AGE_HOURS", "24"))
 IG_CAPTION_LIMIT = 2200
 
 # Identité de la page
 BRAND_NAME = ("Money", ".impact")
 BRAND_HANDLE = "@money.impact.today"
 BRAND_ACCENT = (255, 196, 0)
+BRAND_TAG = os.getenv("BRAND_TAG", "#MONEY_IMPACT")   # étiquette au-dessus du titre
+# Police arabe grasse. Idéal : Cairo-Bold.ttf ou Tajawal-Bold.ttf dans le dossier ./fonts/
+AR_FONT_ENV = os.getenv("AR_FONT_PATH", "")
 
 BASE_DIR = Path(__file__).resolve().parent if "__file__" in globals() else Path.cwd()
 OUTPUT_DIR = BASE_DIR / "output"
@@ -85,7 +96,7 @@ STYLE_SUFFIX = (
     "warm cinematic side lighting, shot on Canon EOS R5, 85mm f/1.4 lens, "
     "shallow depth of field, creamy bokeh, tack-sharp focus on the hero subject, "
     "editorial photography, professional color grading in deep navy blue and warm gold, "
-    "photorealistic, ultra detailed, 8k, bottom fifth of the frame dark and uncluttered, "
+    "photorealistic, ultra detailed, 8k, hero subject in the upper 60% of the frame, lower 40% of the frame dark, smooth and uncluttered, "
     "no text, no letters, no logos, no people"
 )
 
@@ -132,10 +143,10 @@ class TextPost:
 
         Rules:
         1. The FIRST WORDS must name the exact physical hero subject.
-        2. Hero subject occupies 40-60% of the frame, sharp focus, slightly off-center.
+        2. Hero subject sits in the UPPER 60% of the frame, sharp focus, slightly off-center.
         3. Background: relevant but blurred (bokeh). Specific lighting (e.g. golden
            hour side-light, tungsten vault light, cold blue dawn light).
-        4. Bottom 20% of the frame must be dark and uncluttered.
+        4. The lower 40% of the frame must be dark, smooth and uncluttered (a headline will be printed there).
         5. Palette: deep navy blue and warm gold.
         6. FORBIDDEN: people, faces, hands, text, letters, numbers, logos, watermarks,
            abstract shapes, 3D renders, neon, computer screens with charts.
@@ -317,55 +328,171 @@ class TextPost:
         except TypeError:
             return ImageFont.load_default()
 
-    def _add_branding(self, img):
-        """Branding net (jamais déformé par l'IA), transparence réellement gérée."""
+    # ------------------------------------------------------------------
+    # Titre arabe + branding style "chaîne d'info" (comme Al Arabiya)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _load_arabic_font(size):
+        candidates = [
+            AR_FONT_ENV,
+            str(BASE_DIR / "fonts" / "Cairo-Bold.ttf"),
+            str(BASE_DIR / "fonts" / "Tajawal-Bold.ttf"),
+            str(BASE_DIR / "fonts" / "NotoSansArabic-Bold.ttf"),
+            "/usr/share/fonts/truetype/noto/NotoSansArabic-Bold.ttf",
+            "/usr/share/fonts/truetype/noto/NotoNaskhArabic-Bold.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+            "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf",
+        ]
+        # Layout BASIC : le texte est déjà reformé/réordonné par arabic_reshaper + bidi.
+        # Avec RAQM, Pillow le re-traiterait et casserait les lettres.
+        layout = getattr(getattr(ImageFont, "Layout", None), "BASIC", None)
+        for chemin in candidates:
+            if chemin and os.path.exists(chemin):
+                try:
+                    if layout is not None:
+                        return ImageFont.truetype(chemin, size, layout_engine=layout)
+                    return ImageFont.truetype(chemin, size)
+                except Exception:
+                    continue
+        return TextPost._load_font(size)
+
+    @staticmethod
+    def _shape(text):
+        """Lettres arabes jointes + ordre droite-à-gauche correct (mots latins inclus)."""
+        if ARABIC_OK:
+            return get_display(arabic_reshaper.reshape(text), base_dir="R")
+        return text
+
+    def _wrap(self, draw, text, font, max_w):
+        lines, cur = [], []
+        for word in text.split():
+            test = " ".join(cur + [word])
+            if cur and draw.textlength(self._shape(test), font=font) > max_w:
+                lines.append(" ".join(cur))
+                cur = [word]
+            else:
+                cur.append(word)
+        if cur:
+            lines.append(" ".join(cur))
+        return lines
+
+    def _fit_headline(self, draw, text, max_w, max_h, w):
+        """Réduit la taille de police jusqu'à ce que le titre tienne (max 4 lignes)."""
+        size, min_size, max_lines = int(w * 0.078), int(w * 0.05), 4
+        while True:
+            font = self._load_arabic_font(size)
+            lines = self._wrap(draw, text, font, max_w)
+            line_h = int(size * 1.4)
+            fits = len(lines) <= max_lines and len(lines) * line_h <= max_h
+            if fits or size <= min_size:
+                break
+            size -= 2
+        if len(lines) > max_lines:
+            lines = lines[:max_lines]
+            lines[-1] = lines[-1].rstrip(" ،,.") + "…"
+        return font, lines, line_h
+
+    def _add_branding(self, img, headline=None):
         img = img.convert("RGBA")
         w, h = img.size
+        margin = int(w * 0.07)
+        has_title = bool(headline and headline.strip())
 
-        # Dégradé doux en bas
-        grad_h = int(h * 0.28)
+        # ---- 1) Dégradés (bas fort pour le titre, haut léger pour le logo) ----
         grad = Image.new("RGBA", (w, h), (0, 0, 0, 0))
         gd = ImageDraw.Draw(grad)
-        for i in range(grad_h):
-            alpha = int(215 * (i / grad_h) ** 1.7)
-            gd.line([(0, h - grad_h + i), (w, h - grad_h + i)], fill=(4, 10, 28, alpha))
+        bottom_h = int(h * (0.50 if has_title else 0.28))
+        for i in range(bottom_h):
+            a = int(235 * (i / bottom_h) ** 1.5)
+            gd.line([(0, h - bottom_h + i), (w, h - bottom_h + i)], fill=(4, 10, 28, a))
+        top_h = int(h * 0.14)
+        for i in range(top_h):
+            a = int(150 * (1 - i / top_h) ** 1.6)
+            gd.line([(0, i), (w, i)], fill=(4, 10, 28, a))
         img = Image.alpha_composite(img, grad)
-
-        font_main = self._load_font(int(w * 0.062))
-        font_sub = self._load_font(int(w * 0.027))
         probe = ImageDraw.Draw(img)
 
+        # ---- 2) Géométrie des éléments ----
+        # Logo en haut à gauche
+        f_logo = self._load_font(int(w * 0.046))
         part_a, part_b = BRAND_NAME
-        wa = probe.textlength(part_a, font=font_main)
-        wb = probe.textlength(part_b, font=font_main)
-        x = (w - (wa + wb)) / 2
-        y_main = h - int(h * 0.108)
+        wa = probe.textlength(part_a, font=f_logo)
+        wb = probe.textlength(part_b, font=f_logo)
+        logo_bb = f_logo.getbbox(part_a + part_b)
+        pad_x, pad_y = int(w * 0.022), int(w * 0.013)
+        lx, ly = int(w * 0.04), int(h * 0.03)
+        logo_box = [lx, ly, lx + wa + wb + 2 * pad_x, ly + logo_bb[3] + 2 * pad_y]
 
-        line_w = int(w * 0.14)
-        y_line = y_main - int(h * 0.016)
-        line_box = [(w - line_w) / 2, y_line, (w + line_w) / 2, y_line + 5]
+        # Handle en bas à gauche
+        f_sub = self._load_font(int(w * 0.027))
+        handle_y = h - int(h * 0.055)
 
-        # Couche ombre + glow (floutée), composée avec vraie transparence
-        fx = Image.new("RGBA", (w, h), (0, 0, 0, 0))
-        fd = ImageDraw.Draw(fx)
-        fd.text((x + 3, y_main + 3), part_a, font=font_main, fill=(0, 0, 0, 200))
-        fd.text((x + wa + 3, y_main + 3), part_b, font=font_main, fill=(0, 0, 0, 200))
-        fx = fx.filter(ImageFilter.GaussianBlur(4))
-        glow = Image.new("RGBA", (w, h), (0, 0, 0, 0))
-        ImageDraw.Draw(glow).rectangle(line_box, fill=BRAND_ACCENT + (170,))
-        glow = glow.filter(ImageFilter.GaussianBlur(7))
-        img = Image.alpha_composite(img, fx)
-        img = Image.alpha_composite(img, glow)
+        # Titre + étiquette
+        title_data = None
+        if has_title:
+            bottom = handle_y - int(h * 0.028)
+            font, lines, line_h = self._fit_headline(
+                probe, headline.strip(), w - 2 * margin, int(h * 0.30), w
+            )
+            top = bottom - len(lines) * line_h
 
-        # Éléments nets
+            f_tag = self._load_font(int(w * 0.036))
+            tb = f_tag.getbbox(BRAND_TAG)
+            tp_x, tp_y = int(w * 0.022), int(w * 0.011)
+            bar_w = max(8, int(w * 0.009))
+            box_w = (tb[2] - tb[0]) + 2 * tp_x + bar_w
+            box_h = tb[3] + 2 * tp_y
+            tag_right = w - margin
+            tag_box = [tag_right - box_w, top - int(h * 0.022) - box_h,
+                       tag_right, top - int(h * 0.022)]
+            title_data = (font, lines, line_h, top, f_tag, tag_box, tp_x, tp_y, bar_w)
+
+        # ---- 3) Couche douce (ombres floutées) ----
+        soft = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+        sd = ImageDraw.Draw(soft)
+        if title_data:
+            font, lines, line_h, top = title_data[:4]
+            for i, line in enumerate(lines):
+                shaped = self._shape(line)
+                lw = probe.textlength(shaped, font=font)
+                sd.text((w - margin - lw, top + i * line_h + 4), shaped,
+                        font=font, fill=(0, 0, 0, 220))
+        soft = soft.filter(ImageFilter.GaussianBlur(5))
+        img = Image.alpha_composite(img, soft)
+
+        # ---- 4) Couche translucide nette (fond du logo) ----
+        crisp = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+        cd = ImageDraw.Draw(crisp)
+        cd.rectangle(logo_box, fill=(4, 10, 28, 190), outline=(255, 255, 255, 220), width=2)
+        img = Image.alpha_composite(img, crisp)
+
+        # ---- 5) Éléments opaques ----
         draw = ImageDraw.Draw(img)
-        draw.rectangle(line_box, fill=BRAND_ACCENT + (255,))
-        draw.text((x, y_main), part_a, font=font_main, fill=(255, 255, 255, 255))
-        draw.text((x + wa, y_main), part_b, font=font_main, fill=BRAND_ACCENT + (255,))
 
-        wh = draw.textlength(BRAND_HANDLE, font=font_sub)
-        y_sub = y_main + int(w * 0.062) + int(h * 0.012)
-        draw.text(((w - wh) / 2, y_sub), BRAND_HANDLE, font=font_sub,
+        # Logo
+        draw.text((lx + pad_x, ly + pad_y), part_a, font=f_logo, fill=(255, 255, 255, 255))
+        draw.text((lx + pad_x + wa, ly + pad_y), part_b, font=f_logo,
+                  fill=BRAND_ACCENT + (255,))
+        draw.rectangle([logo_box[0], logo_box[3] - 5, logo_box[2], logo_box[3]],
+                       fill=BRAND_ACCENT + (255,))
+
+        if title_data:
+            font, lines, line_h, top, f_tag, tag_box, tp_x, tp_y, bar_w = title_data
+            # Étiquette blanche + barre dorée à droite
+            draw.rectangle(tag_box, fill=(255, 255, 255, 255))
+            draw.rectangle([tag_box[2] - bar_w, tag_box[1], tag_box[2], tag_box[3]],
+                           fill=BRAND_ACCENT + (255,))
+            draw.text((tag_box[0] + tp_x, tag_box[1] + tp_y), BRAND_TAG,
+                      font=f_tag, fill=(5, 12, 30, 255))
+            # Titre aligné à droite
+            for i, line in enumerate(lines):
+                shaped = self._shape(line)
+                lw = draw.textlength(shaped, font=font)
+                draw.text((w - margin - lw, top + i * line_h), shaped,
+                          font=font, fill=(255, 255, 255, 255))
+
+        # Handle
+        draw.text((int(w * 0.04), handle_y), BRAND_HANDLE, font=f_sub,
                   fill=(225, 230, 240, 235))
 
         return img.convert("RGB")
@@ -373,7 +500,7 @@ class TextPost:
     # ------------------------------------------------------------------
     # 5) Pipeline image complet
     # ------------------------------------------------------------------
-    def generer_image(self, news_original=None):
+    def generer_image(self, news_original=None, headline=None):
         print("Génération de l'image...")
         prompt = self._build_prompt(news_original)
         print("Prompt image :", prompt)
@@ -385,7 +512,7 @@ class TextPost:
         # Même ratio (4:5) -> recadrage minimal, pas de perte de détail
         img = ImageOps.fit(img, (OUT_W, OUT_H), Image.LANCZOS, centering=(0.5, 0.4))
         img = self._enhance_image(img)
-        img = self._add_branding(img)
+        img = self._add_branding(img, headline)
 
         output_png = OUTPUT_DIR / "img.png"
         img.save(output_png)
@@ -404,11 +531,11 @@ class TextPost:
             return response.json()
         return {"message": response.text[:1000]}
 
-    def publier_texte_partout(self, news_original, news_translited):
+    def publier_texte_partout(self, news_original, news_translited, headline=None):
         resultats = {"image": None, "facebook": False, "instagram": False}
 
         try:
-            chemin = Path(self.generer_image(news_original=news_original))
+            chemin = Path(self.generer_image(news_original=news_original, headline=headline))
             if not chemin.is_file():
                 raise FileNotFoundError(f"Image générée introuvable : {chemin.resolve()}")
             resultats["image"] = str(chemin.resolve())
@@ -581,8 +708,11 @@ class Extract_post:
         prompt = """
         You are a professional Arabic translator specializing in financial news.
         Translate into natural Modern Standard Arabic. Preserve financial meaning and facts.
-        Return ONLY a valid JSON object:
-        {"caption": "translated_text_here"}
+        Return ONLY a valid JSON object with two fields:
+        {"caption": "full translation of the text",
+         "headline": "short punchy Arabic news headline"}
+        The headline: 8 to 15 words, newsroom style, captures the key fact (and the
+        market impact if any), no emojis, no hashtags, no quotation marks, no source name.
         """
         try:
             response = self.client.chat.completions.create(
@@ -660,9 +790,13 @@ def main():
             print("Traduction vide, on passe.")
             continue
 
+        headline = str(text_translated.get("headline") or "").strip()
+        if not headline:  # secours : début de la légende
+            headline = " ".join(caption.split()[:14])
+
         tentatives += 1
         try:
-            resultat = text_post.publier_texte_partout(text_original, caption)
+            resultat = text_post.publier_texte_partout(text_original, caption, headline)
 
             if resultat and (resultat.get("facebook") or resultat.get("instagram")):
                 historique[post_id] = {"source": vrai_source, "titre": title, "date": date}
