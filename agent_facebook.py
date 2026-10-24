@@ -670,10 +670,13 @@ def main():
             "date": date
         }
         changement_detecte = True
-        break
+        
         if changement_detecte:
             with open(fichier_json, "w", encoding="utf-8") as f:
                 json.dump(historique, f, ensure_ascii=False, indent=4)
+        import os
+        print("JSON PATH:", os.path.abspath(fichier_json))
+        break
     
     print("Fin de cette exécution.")
     
